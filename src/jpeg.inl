@@ -1450,7 +1450,7 @@ static int JPEGFilter(uint8_t *pBuf, uint8_t *d, int iLen, uint8_t *bFF)
 {
 #ifdef HAS_SSE
 	__m128i xmmIn, xmmOut;
-        __m128i xmmFF = _mm_cmpeq_epi8(xmmIn, xmmIn);
+        __m128i xmmFF = _mm_set1_epi8((char)0xff); // not compared from xmmIn, which is not set yet
 #endif // HAS_SSE
 #ifdef HAS_NEON
 	uint8x16_t u816FF = vdupq_n_u8(0xff);
