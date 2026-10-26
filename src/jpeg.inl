@@ -5437,7 +5437,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     if (iCols > mcuCX) iCols = mcuCX;
                     if (iRows > mcuCY) iRows = mcuCY;
                     for (i = 0; i < iRows; i++)
-                        memcpy(&pFBDest[(i * iPitch + xoff) * iBpp], &((uint8_t *)pAlignedPixels)[i * mcuCX * iBpp], iCols * iBpp);
+                        memcpy(&pFBDest[((size_t)i * iPitch + xoff) * iBpp], &((uint8_t *)pAlignedPixels)[i * mcuCX * iBpp], (size_t)iCols * iBpp);
                     pJPEG->usPixels = (uint16_t *)pFBDest;
                 }
                 xoff += mcuCX;
