@@ -1847,19 +1847,12 @@ static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
     unsigned short *pFast;
     uint32_t usHuff; // this prevents an unnecessary & 65535 for shorts
     signed int iPositive, iNegative, iCoeff;
-    // A skipped block (MCU_SKIP, a negative offset) is still decoded to keep the place in the data, into scratch
-    signed short sSkipped[DCTSIZE];
-    signed short *pMCU;
+    // A skipped block (MCU_SKIP, a negative offset) is still decoded to keep the place in the data, but stores nothing
+    signed short *pMCU = (iMCU >= 0) ? &pJPEG->sMCUs[iMCU] : NULL;
     uint32_t ulBitOff;
     my_ulong ulCode, ulBits, ulTemp; // local copies to allow compiler to use register vars
     uint8_t *pBuf;
 
-    if (iMCU < 0) {
-        memset(sSkipped, 0, sizeof(sSkipped));
-        pMCU = sSkipped;
-    } else {
-        pMCU = &pJPEG->sMCUs[iMCU];
-    }
     ulBitOff = pJPEG->bb.ulBitOff;
     ulBits = pJPEG->bb.ulBits;
     pBuf = pJPEG->bb.pBuf;
@@ -1883,7 +1876,8 @@ static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
             {
                 //            (*iDCPredictor) |= iPositive;  // in case the scan is run more than once
                 //            pMCU[0] = *iDCPredictor; // store in MCU[0]
-                pMCU[0] |= iPositive;
+                if (pMCU)
+                    pMCU[0] |= iPositive;
             }
             goto mcu_done; // that's it
         }
@@ -1915,7 +1909,8 @@ static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
             ulCode <<= pJPEG->cApproxBitsLow; // successive approximation shift value
             (*iDCPredictor) += ulCode;
         }
-        pMCU[0] = (short)*iDCPredictor; // store in MCU[0]
+        if (pMCU)
+            pMCU[0] = (short)*iDCPredictor; // store in MCU[0]
     }
     // Now get the other 63 AC coefficients
     pFast = &pJPEG->usHuffAC[pJPEG->ucACTable * HUFF11SIZE];
@@ -1975,7 +1970,7 @@ static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
                 // value of the coefficient must be increased.
                 iCount = (usHuff >> 4); // get RRRR in lower 4 bits
                 do {
-                    if (pMCU[iIndex])
+                    if (pMCU && pMCU[iIndex]) // a skipped block's coefficients are treated as zero
                     {
                         if (ulBitOff > (REGISTER_WIDTH-17)) { // need to get more data
                             pBuf += (ulBitOff >> 3);
@@ -2002,7 +1997,7 @@ static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
                     }
                     iIndex++;
                 } while (iIndex <= pJPEG->iScanEnd);
-                if (iCoeff && iIndex < 0x40) // store the non-zero coefficient
+                if (iCoeff && iIndex < 0x40 && pMCU) // store the non-zero coefficient
                     pMCU[iIndex] = (short) iCoeff;
             } // for - AC coeffs
         } // if not skipped
@@ -2097,7 +2092,9 @@ static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
                             ulCode -= 0xffffffff>>(REGISTER_WIDTH - 16 - -usHuff);
                         ulBitOff += usHuff; // add (SSSS) extra length
                         ulCode <<= pJPEG->cApproxBitsLow; // successive approximation shift value
-                        pMCU[iIndex++] = (signed short)ulCode; // store AC coefficient
+                        if (pMCU)
+                            pMCU[iIndex] = (signed short)ulCode; // store AC coefficient
+                        iIndex++;
                     }
                 }
             } // while
