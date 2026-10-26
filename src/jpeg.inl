@@ -3458,7 +3458,7 @@ static void JPEGPutMCU11(JPEGIMAGE *pJPEG, int x, int iPitch)
 // R = Y                + 1.40200 * Cr
 // G = Y - 0.34414 * Cb + 0.28586 * Cr - Cr
 // B = Y - 0.22800 * Cb + Cb + Cb
-
+    if (x + 8 <= iPitch) { // only for non-clipped MCUs
  if (pJPEG->ucPixelType == RGB8888) {
     __m128i mmxY, mmxCr, mmxCb, mmxTemp;
     __m128i mmxTemp2, mmxR, mmxG, mmxB;
@@ -3561,6 +3561,7 @@ static void JPEGPutMCU11(JPEGIMAGE *pJPEG, int x, int iPitch)
          } // for each row
      return;
      }
+    } // not clipped
 #endif // HAS_SSE
 
 // C reference version
@@ -3580,7 +3581,7 @@ static void JPEGPutMCU11(JPEGIMAGE *pJPEG, int x, int iPitch)
                 Y = (int)(*pY++) << 12;
                 JPEGPixelLE(pOutput+iCol, Y, iCb, iCr);
             } // for col
-            pCr += delta; pCb += delta;
+            pCr += delta; pCb += delta; pY += delta;
         }
         else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN)
         {
@@ -3591,7 +3592,7 @@ static void JPEGPutMCU11(JPEGIMAGE *pJPEG, int x, int iPitch)
                 Y = (int)(*pY++) << 12;
                 JPEGPixelBE(pOutput+iCol, Y, iCb, iCr);
             } // for col
-            pCr += delta; pCb += delta;
+            pCr += delta; pCb += delta; pY += delta;
         } else { // RGB888
             for (iCol=0; iCol<w; iCol++) // up to 4x2 cols to do
             {
@@ -3600,7 +3601,7 @@ static void JPEGPutMCU11(JPEGIMAGE *pJPEG, int x, int iPitch)
                 Y = (int)(*pY++) << 12;
                 JPEGPixelRGB((uint32_t *)&pOutput[iCol*2], Y, iCb, iCr);
             } // for col
-            pCr += delta; pCb += delta;
+            pCr += delta; pCb += delta; pY += delta;
         }
         pOutput += (pJPEG->ucPixelType == RGB8888) ? iPitch*2 : iPitch;
     } // for row
@@ -3814,7 +3815,7 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
 #endif // ESP32S3_SIMD
 
 #ifdef HAS_NEON
-    if (x+8 <= iPitch && (iPitch & 15) == 0) { // only for non-clipped MCUs
+    if (x+16 <= iPitch) { // only for non-clipped MCUs
     if (pJPEG->ucPixelType == RGB8888) {
        int8x8_t i88Cr, i88Cb;
        uint8x16_t u816YL, u816YR;
@@ -4055,7 +4056,7 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
 // R = Y                + 1.40200 * Cr
 // G = Y - 0.34414 * Cb + 0.28586 * Cr - Cr
 // B = Y - 0.22800 * Cb + Cb + Cb
-
+    if (x + 16 <= iPitch) { // only for non-clipped MCUs
  if (pJPEG->ucPixelType == RGB8888) {
     __m128i mmxY, mmxCr, mmxCb, mmxTemp;
     __m128i mmxTemp2, mmxR, mmxG, mmxB;
@@ -4352,6 +4353,7 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
          } // for each row
      return;
      } // 16bpp
+    } // not clipped
 #endif // HAS_SSE
     /* Reference C code */
     /* Convert YCC pixels into RGB pixels and store in output image */
@@ -5062,7 +5064,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
-    int iCropX, iCropY, iCropCX; // the crop area at the output scale
+    int iCropX, iCropY, iCropCX, iCropCY; // the crop area at the output scale
 
     if (!pJPEG->bDecodeActive || iRows < 1)
     {
@@ -5143,6 +5145,10 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     iCropX = pJPEG->iCropX >> iScaleShift;
     iCropY = pJPEG->iCropY >> iScaleShift;
     iCropCX = (pJPEG->iCropCX + (1 << iScaleShift) - 1) >> iScaleShift;
+    // The output height, ending at the edge of the image; a framebuffer has no rows below it
+    iCropCY = pJPEG->iCropY + pJPEG->iCropCY;
+    if (iCropCY > pJPEG->iHeight) iCropCY = pJPEG->iHeight;
+    iCropCY = ((iCropCY + (1 << iScaleShift) - 1) >> iScaleShift) - iCropY;
     
     iQuant1 = pJPEG->sQuantTable[pJPEG->JPCI[0].quant_tbl_no*DCTSIZE]; // DC quant values
     iQuant2 = pJPEG->sQuantTable[pJPEG->JPCI[1].quant_tbl_no*DCTSIZE];
@@ -5215,7 +5221,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
             iPitch = iCropCX; // size of cropped width
             pJPEG->usPixels = (uint16_t *)pJPEG->pFramebuffer;
             if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
-                pJPEG->usPixels += (ty * iPitch/2); // 1 byte per pixel
+                pJPEG->usPixels = (uint16_t *)((uint8_t *)pJPEG->pFramebuffer + ty * iPitch); // 1 byte per pixel, so the row can start on an odd byte
             } else  if (pJPEG->ucPixelType == RGB8888) {
                  pJPEG->usPixels += (ty * iPitch*2); // 4 bytes per pixel
             } else { // 2 bytes per pixel
@@ -5393,27 +5399,47 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                 }
             } // if color components present
             if (!iSkipMask) { // this MCU is not skipped
+                // The MCU writers draw whole MCUs, so in a framebuffer one that runs past the right or bottom edge
+                // of the output is drawn into the internal pixel buffer and only the part inside is copied
+                uint8_t *pFBDest = NULL;
+                int iPutX = xoff, iPutPitch = iPitch;
+                if (pJPEG->pFramebuffer && !pJPEG->pDitherBuffer &&
+                    (xoff + mcuCX > iPitch || (y * mcuCY) - iCropY + mcuCY > iCropCY)) {
+                    pFBDest = (uint8_t *)pJPEG->usPixels;
+                    pJPEG->usPixels = pAlignedPixels;
+                    iPutX = 0;
+                    iPutPitch = mcuCX;
+                }
                 if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
-                    JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
+                    JPEGPutMCU8BitGray(pJPEG, iPutX, iPutPitch); // grayscale or color is being drawn as grayscale
                 } else {
                     switch (pJPEG->ucSubSample) {
                         case 0x00: // grayscale
-                            JPEGPutMCUGray(pJPEG, xoff, iPitch);
+                            JPEGPutMCUGray(pJPEG, iPutX, iPutPitch);
                             break;
                         case 0x11:
-                            JPEGPutMCU11(pJPEG, xoff, iPitch);
+                            JPEGPutMCU11(pJPEG, iPutX, iPutPitch);
                             break;
                         case 0x12:
-                            JPEGPutMCU12(pJPEG, xoff, iPitch);
+                            JPEGPutMCU12(pJPEG, iPutX, iPutPitch);
                             break;
                         case 0x21:
-                            JPEGPutMCU21(pJPEG, xoff, iPitch);
+                            JPEGPutMCU21(pJPEG, iPutX, iPutPitch);
                             break;
                         case 0x22:
-                            JPEGPutMCU22(pJPEG, xoff, iPitch);
+                            JPEGPutMCU22(pJPEG, iPutX, iPutPitch);
                             break;
                     } // switch on color option
                 } // normal MCU drawing
+                if (pFBDest) { // copy the part of the MCU inside the output
+                    int iBpp = (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) ? 1 : (pJPEG->ucPixelType == RGB8888) ? 4 : 2;
+                    int iCols = iPitch - xoff, iRows = iCropCY - ((y * mcuCY) - iCropY);
+                    if (iCols > mcuCX) iCols = mcuCX;
+                    if (iRows > mcuCY) iRows = mcuCY;
+                    for (i = 0; i < iRows; i++)
+                        memcpy(&pFBDest[(i * iPitch + xoff) * iBpp], &((uint8_t *)pAlignedPixels)[i * mcuCX * iBpp], iCols * iBpp);
+                    pJPEG->usPixels = (uint16_t *)pFBDest;
+                }
                 xoff += mcuCX;
             } // if not skipped
             if (pJPEG->pFramebuffer == NULL && (xoff == iPitch || x == cx-1) && !iSkipMask) // time to draw

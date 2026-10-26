@@ -34,7 +34,7 @@ static bool decode(JPEGDEC &jpeg, std::vector<uint8_t> &file, int type, int opti
   if (!jpeg.openRAM(file.data(), static_cast<int>(file.size()), draw_cb))
     return false;
   jpeg.setPixelType(type);
-  bytes_per_pixel = type == RGB8888 ? 4 : 2;
+  bytes_per_pixel = type == RGB8888 ? 4 : type == EIGHT_BIT_GRAYSCALE ? 1 : 2;
   int w = jpeg.getWidth(), h = jpeg.getHeight();
   x0 = y0 = 0;
   if (crop != CROP_NONE) {
@@ -51,8 +51,8 @@ static bool decode(JPEGDEC &jpeg, std::vector<uint8_t> &file, int type, int opti
   outside = 0;
   canvas.assign(static_cast<size_t>(canvas_w) * canvas_h * bytes_per_pixel, 0);
   if (framebuffer) {
-    // Exactly the output's width, with room for whole MCU rows below it
-    std::vector<uint8_t> fb(static_cast<size_t>(canvas_w) * (canvas_h + 16) * bytes_per_pixel, 0);
+    // Exactly the size of the output, so ASan catches an MCU drawn past its right or bottom edge
+    std::vector<uint8_t> fb(static_cast<size_t>(canvas_w) * canvas_h * bytes_per_pixel, 0);
     jpeg.setFramebuffer(fb.data());
     jpeg.decode(0, 0, options);
     for (size_t i = 0; i < canvas.size(); i++)
@@ -81,9 +81,8 @@ int main(int argc, char **argv) {
     fclose(f);
     jpeg.openRAM(file.data(), static_cast<int>(file.size()), draw_cb);
     const bool progressive = jpeg.getJPEGType() == JPEG_MODE_PROGRESSIVE;
-    const int width = jpeg.getWidth();
     jpeg.close();
-    for (int type : {RGB565_LITTLE_ENDIAN, RGB8888}) {
+    for (int type : {RGB565_LITTLE_ENDIAN, RGB8888, EIGHT_BIT_GRAYSCALE}) {
       for (int k = 0; k < 4; k++) {
         if (progressive && k != 0)
           continue;  // a progressive image always comes out at 1/8 size
@@ -92,12 +91,10 @@ int main(int argc, char **argv) {
         decode(jpeg, file, type, options[k], scale, CROP_NONE, false, fx, fy);
         const std::vector<uint8_t> full = canvas;
         const int full_w = canvas_w, full_h = canvas_h;
-        for (CropKind crop : {CROP_MIDDLE, CROP_CORNER}) {
+        for (CropKind crop : {CROP_NONE, CROP_MIDDLE, CROP_CORNER}) {
           for (bool framebuffer : {false, true}) {
-            // A framebuffer gets whole MCUs, so the last one in a row spills into the next row when the image
-            // width is not a whole number of them; that is a separate, known limitation
-            if (framebuffer && crop == CROP_CORNER && width % 16 != 0)
-              continue;
+            if (crop == CROP_NONE && !framebuffer)
+              continue;  // that is the reference
             checks++;
             int x0, y0;
             decode(jpeg, file, type, options[k], scale, crop, framebuffer, x0, y0);
@@ -109,7 +106,7 @@ int main(int argc, char **argv) {
                                               full[(static_cast<size_t>(y0 + y) * full_w + x0 + x) * bytes_per_pixel + b]));
             if (worst != 0 || outside != 0) {
               printf("FAIL %s type %d scale 1/%d %s crop%s: max difference %d, %d pixels drawn outside the crop\n",
-                     argv[a], type, scale, crop == CROP_MIDDLE ? "middle" : "corner",
+                     argv[a], type, scale, crop == CROP_NONE ? "no" : crop == CROP_MIDDLE ? "middle" : "corner",
                      framebuffer ? " into a framebuffer" : "", worst, outside);
               failures++;
             }
