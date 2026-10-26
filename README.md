@@ -17,11 +17,11 @@ Later upstream fixes are taken as they are needed.
 
 ## Usage
 
-Add to `platformio.ini`, using the latest [release](https://github.com/esphome-libs/JPEGDEC/releases) tag:
+Add to `platformio.ini`, replacing `<tag>` with a [release](https://github.com/esphome-libs/JPEGDEC/releases) tag:
 
 ```ini
 lib_deps =
-    https://github.com/esphome-libs/JPEGDEC#1.8.4-esphome.3
+    https://github.com/esphome-libs/JPEGDEC#<tag>
 ```
 
 The API is upstream's, described in its [wiki](https://github.com/bitbank2/JPEGDEC/wiki).
@@ -53,7 +53,7 @@ This needs Python with Pillow to write the test images. `step_test` checks that 
 
 ## Releases
 
-Releases are tagged `<upstream version>-esphome.<n>`, for example `1.8.4-esphome.3`, from `main`. Fixes are pull requests against `main`.
+Releases are tagged `<upstream version>-esphome.<n>` from `main`. Fixes are pull requests against `main`.
 
 ## License
 
