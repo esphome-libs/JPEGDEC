@@ -74,6 +74,23 @@ static int32_t seekFile(JPEGFILE *pFile, int32_t iPosition);
 static void closeFile(void *handle);
 #endif
 static void JPEGDither(JPEGIMAGE *pJPEG, int iWidth, int iHeight);
+static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable);
+static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG);
+static void JPEGFreeP(JPEGIMAGE *pJPEG);
+
+// The coefficient buffer of a progressive image is allocated with these; define them to use another allocator
+#ifndef JPEG_MALLOC
+#define JPEG_MALLOC(size) malloc(size)
+#define JPEG_FREE(p) free(p)
+#endif
+
+// Where the decode of a progressive image is
+enum {
+    JPEG_PROG_HEADER = 0, // reading the markers between scans
+    JPEG_PROG_SCAN, // decoding a scan
+    JPEG_PROG_SKIP, // passing over a scan that is not needed
+    JPEG_PROG_DRAW // every scan is decoded; drawing the image
+};
 /* JPEG tables */
 const int iBitMasks[33] = {0,1,3,7,0xf,0x1f,0x3f,0x7f,0xff,0x1ff,0x3ff,0x7ff,0x0fff,0x1fff,0x3fff,0x7fff,0xffff,0x1ffff,0x3ffff,0x7ffff,0xfffff,0x1fffff,0x3fffff,0x7fffff,0xffffff,0x1ffffff,0x3ffffff,0x7ffffff,0xfffffff,0x1fffffff,0x3fffffff,0x7fffffff,1};
 // zigzag ordering of DCT coefficients
@@ -684,6 +701,7 @@ int JPEG_decodeDither(JPEGIMAGE *pJPEG, uint8_t *pDither, int iOptions)
 
 void JPEG_close(JPEGIMAGE *pJPEG)
 {
+    JPEGFreeP(pJPEG);
     if (pJPEG->pfnClose)
         (*pJPEG->pfnClose)(pJPEG->JPEGFile.fHandle);
 } /* JPEG_close() */
@@ -864,28 +882,27 @@ static int JPEGGetHuffTables(uint8_t *pBuf, int iLen, JPEGIMAGE *pJPEG)
         ucTable = pBuf[iOffset++]; // get table index
         if (ucTable & 0x10) // convert AC offset of 0x10 into offset of 4
             ucTable ^= 0x14;
+        if (ucTable > 7) // tables are 0-3, AC+DC
+            return -1;
         pJPEG->ucHuffTableUsed |= (1 << ucTable); // mark this table as being defined
-        if (ucTable <= 7) // tables are 0-3, AC+DC
+        iTableOffset = ucTable * HUFF_TABLEN;
+        j = 0; // total bits
+        for (i=0; i<16; i++)
         {
-            iTableOffset = ucTable * HUFF_TABLEN;
-            j = 0; // total bits
-            for (i=0; i<16; i++)
-            {
-                j += pBuf[iOffset];
-                pHuffVals[iTableOffset+i] = pBuf[iOffset++];
-            }
-            iLen -= 17; // subtract length of bit lengths
-            if (j == 0 || j > 256 || j > iLen) // bogus bit lengths
-            {
-                return -1;
-            }
-            iTableOffset += 16;
-            for (i=0; i<j; i++)
-            {  // copy huffman table
-                pHuffVals[iTableOffset+i] = pBuf[iOffset++];
-            }
-            iLen -= j;
+            j += pBuf[iOffset];
+            pHuffVals[iTableOffset+i] = pBuf[iOffset++];
         }
+        iLen -= 17; // subtract length of bit lengths
+        if (j == 0 || j > 256 || j > iLen) // bogus bit lengths
+        {
+            return -1;
+        }
+        iTableOffset += 16;
+        for (i=0; i<j; i++)
+        {  // copy huffman table
+            pHuffVals[iTableOffset+i] = pBuf[iOffset++];
+        }
+        iLen -= j;
     }
     return 0;
 } /* JPEGGetHuffTables() */
@@ -1095,6 +1112,8 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     int iMaxLength, iMaxMask;
     int iTablesUsed;
     
+    if (pJPEG->ucMode == 0xc2) // progressive images have their own tables
+        return JPEGMakeHuffTablesP(pJPEG);
     iTablesUsed = 0;
     pHuffVals = (uint8_t *)pJPEG->usPixels;
     for (j=0; j<4; j++)
@@ -1147,7 +1166,7 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
                     ucCode = *p++;  // get actual huffman code
                     // does precalculating the DC value save time on ARM?
 #ifndef USE_ARM_ASM
-                    if (ucCode != 0 && (ucCode + iBitNum) <= 6 && pJPEG->ucMode != 0xc2) // we can fit the magnitude value in the code lookup (not for progressive)
+                    if (ucCode != 0 && (ucCode + iBitNum) <= 6) // we can fit the magnitude value in the code lookup
                     {
                         int k, iLoop;
                         unsigned char ucCoeff;
@@ -1196,7 +1215,6 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     }
     // now do AC components (up to 4 tables of 16-bit codes)
     // We split the codes into a short table (9 bits or less) and a long table (first 5 bits are 1)
-    if (pJPEG->ucMode == 0xc2) return 1; // don't calculate for progressive mode
     for (iTable = 0; iTable < 4; iTable++)
     {
         if (pJPEG->ucHuffTableUsed & (1 << (iTable+4)))  // if this table is defined
@@ -1589,14 +1607,57 @@ static void JPEGGetMoreData(JPEGIMAGE *pPage)
 } /* JPEGGetMoreData() */
 
 //
+// Read the quantization tables of a DQT segment, and with bFix, reorder them for decoding
+// Returns 0 for success, -1 for an invalid table number
+//
+static int JPEGGetQuantTables(JPEGIMAGE *pJPEG, uint8_t *s, int iLen, int bFix)
+{
+    int i, iTableOffset;
+    uint8_t ucTable;
+
+    while (iLen > 0)
+    {
+        /* first byte has PPPPNNNN where P = precision and N = table number 0-3 */
+        ucTable = *s++;
+        if ((ucTable & 0xf) > 3) // invalid table number
+            return -1;
+        iTableOffset = (ucTable & 0xf) * DCTSIZE;
+        if (ucTable & 0xf0) // if word precision
+        {
+            if (iLen < DCTSIZE*2 + 1) // not a whole table
+                break;
+            for (i=0; i<DCTSIZE; i++)
+            {
+                pJPEG->sQuantTable[i+iTableOffset] = MOTOSHORT(s);
+                s += 2;
+            }
+            iLen -= (DCTSIZE*2 + 1);
+        }
+        else // byte precision
+        {
+            if (iLen < DCTSIZE + 1)
+                break;
+            for (i=0; i<DCTSIZE; i++)
+            {
+                pJPEG->sQuantTable[i+iTableOffset] = (unsigned short)*s++;
+            }
+            iLen -= (DCTSIZE + 1);
+        }
+        if (bFix)
+            JPEGFixQuantTable(pJPEG, ucTable & 0xf);
+    }
+    return 0;
+} /* JPEGGetQuantTables() */
+
+//
 // Parse the JPEG header, gather necessary info to decode the image
 // Returns 1 for success, 0 for failure
 //
 static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
 {
     int iBytesRead;
-    int i, iOffset, iTableOffset;
-    uint8_t ucTable, *s = pPage->ucFileBuf;
+    int i, iOffset;
+    uint8_t *s = pPage->ucFileBuf;
     uint16_t usMarker, usLen = 0;
     int iFilePos = 0;
     
@@ -1707,6 +1768,11 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                 pPage->iCropCY = pPage->iHeight = MOTOSHORT(&s[iOffset+3]);
                 pPage->iCropCX = pPage->iWidth = MOTOSHORT(&s[iOffset+5]);
                 pPage->ucNumComponents = s[iOffset+7];
+                if (pPage->ucNumComponents == 0 || pPage->ucNumComponents > MAX_COMPS_IN_SCAN) // more than JPCI holds
+                {
+                    pPage->iError = JPEG_UNSUPPORTED_FEATURE;
+                    return 0;
+                }
                 pPage->ucBpp = pPage->ucBpp * pPage->ucNumComponents; /* Bpp = number of components * bits per sample */
                 {
                     usLen -= 8;
@@ -1720,8 +1786,8 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                         ucSamp = s[iOffset++]; // get the h+v sampling factor
                         if (i == 0) // Y component?
                             pPage->ucSubSample = ucSamp;
-//                        pPage->JPCI[i].h_samp_factor = ucSamp >> 4;
-//                        pPage->JPCI[i].v_samp_factor = ucSamp & 0xf;
+                        pPage->JPCI[i].h_samp_factor = ucSamp >> 4;
+                        pPage->JPCI[i].v_samp_factor = ucSamp & 0xf;
                         pPage->JPCI[i].quant_tbl_no = s[iOffset++]; // quantization table number
                         if (pPage->JPCI[i].quant_tbl_no > 3)
                         {
@@ -1733,6 +1799,7 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                 }
                 if (pPage->ucNumComponents == 1) {
                     pPage->ucSubSample = 0; // use this to differentiate from color 1:1
+                    pPage->JPCI[0].h_samp_factor = pPage->JPCI[0].v_samp_factor = 1; // blocks are not grouped
                 }
                 break;
             case 0xffdd: // Restart Interval
@@ -1750,35 +1817,10 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                 break;
             case 0xffdb: /* M_DQT */
                 /* Get the quantization tables */
-                /* first byte has PPPPNNNN where P = precision and N = table number 0-3 */
-                iOffset += 2; // skip length
-                usLen -= 2; // subtract length length
-                while (usLen > 0)
+                if (JPEGGetQuantTables(pPage, &s[iOffset+2], usLen - 2, 0) != 0)
                 {
-                    ucTable = s[iOffset++]; // table number
-                    if ((ucTable & 0xf) > 3) // invalid table number
-                    {
-                        pPage->iError = JPEG_DECODE_ERROR;
-                        return 0;
-                    }
-                    iTableOffset = (ucTable & 0xf) * DCTSIZE;
-                    if (ucTable & 0xf0) // if word precision
-                    {
-                        for (i=0; i<DCTSIZE; i++)
-                        {
-                            pPage->sQuantTable[i+iTableOffset] = MOTOSHORT(&s[iOffset]);
-                            iOffset += 2;
-                        }
-                        usLen -= (DCTSIZE*2 + 1);
-                    }
-                    else // byte precision
-                    {
-                        for (i=0; i<DCTSIZE; i++)
-                        {
-                            pPage->sQuantTable[i+iTableOffset] = (unsigned short)s[iOffset++];
-                        }
-                        usLen -= (DCTSIZE + 1);
-                    }
+                    pPage->iError = JPEG_DECODE_ERROR;
+                    return 0;
                 }
                 break;
         } // switch on JPEG marker
@@ -1796,6 +1838,18 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
             pPage->iError = JPEG_UNSUPPORTED_FEATURE;
             return 0;
         }
+        if (pPage->ucMode == 0xc2) // progressive: each scan's data is filtered as it is decoded
+        {
+            if (iOffset > iBytesRead)
+            {
+                pPage->iError = JPEG_DECODE_ERROR;
+                return 0;
+            }
+            pPage->iVLCOff = pPage->iVLCSize = 0;
+            pPage->iRawOff = iOffset;
+            pPage->iRawSize = iBytesRead;
+            return 1;
+        }
         // Now the offset points to the start of compressed data
         i = JPEGFilter(&pPage->ucFileBuf[iOffset], pPage->ucFileBuf, iBytesRead-iOffset, &pPage->ucFF);
         pPage->iVLCOff = 0;
@@ -1809,307 +1863,834 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
 //
 // Fix and reorder the quantization table for faster decoding.*
 //
-static void JPEGFixQuantD(JPEGIMAGE *pJPEG)
+static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable)
 {
-    int iTable, iTableOffset;
+    int iTableOffset;
     signed short sTemp[DCTSIZE];
     int i;
     uint16_t *p;
     
-    for (iTable=0; iTable<pJPEG->ucNumComponents; iTable++)
-    {
-        iTableOffset = iTable * DCTSIZE;
-        p = (uint16_t *)&pJPEG->sQuantTable[iTableOffset];
-        for (i=0; i<DCTSIZE; i++)
-            sTemp[i] = p[cZigZag[i]];
-        memcpy(&pJPEG->sQuantTable[iTableOffset], sTemp, DCTSIZE*sizeof(short)); // copy back to original spot
-        
-        // Prescale for DCT multiplication
-        p = (uint16_t *)&pJPEG->sQuantTable[iTableOffset];
-        for (i=0; i<DCTSIZE; i++)
-        {
-            p[i] = (uint16_t)((p[i] * iScaleBits[i]) >> 12);
-        }
-    }
-} /* JPEGFixQuantD() */
-/****************************************************************************
- *                                                                          *
- *  FUNCTION   : JPEGDecodeMCU_P(char *, int *, int *, int *, JPEGDATA *)   *
- *                                                                          *
- *  PURPOSE    : Decompress a macro block of Progressive JPEG data.         *
- *                                                                          *
- ****************************************************************************/
-static int JPEGDecodeMCU_P(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
-{
-    int iCount;
-    int iIndex;
-    unsigned char ucHuff, *pFastDC;
-    unsigned short *pFast;
-    uint32_t usHuff; // this prevents an unnecessary & 65535 for shorts
-    signed int iPositive, iNegative, iCoeff;
-    // A skipped block (MCU_SKIP, a negative offset) is still decoded to keep the place in the data, but stores nothing
-    signed short *pMCU = (iMCU >= 0) ? &pJPEG->sMCUs[iMCU] : NULL;
-    uint32_t ulBitOff;
-    my_ulong ulCode, ulBits, ulTemp; // local copies to allow compiler to use register vars
-    uint8_t *pBuf;
-
-    ulBitOff = pJPEG->bb.ulBitOff;
-    ulBits = pJPEG->bb.ulBits;
-    pBuf = pJPEG->bb.pBuf;
-        
-    if (ulBitOff > (REGISTER_WIDTH-17)) { // need to get more data
-        pBuf += (ulBitOff >> 3);
-        ulBitOff &= 7;
-        ulBits = MOTOLONG(pBuf);
-    }
-
-    iPositive = (1 << pJPEG->cApproxBitsLow); // positive bit position being coded
-    iNegative = ((-1) << pJPEG->cApproxBitsLow); // negative bit position being coded
-        
-    if (pJPEG->iScanStart == 0)
-    {
-        if (pJPEG->cApproxBitsHigh) // successive approximation - simply encodes the specified bit
-        {
-            ulCode = (ulBits >> (31-ulBitOff)) & 1; // just get 1 bit
-            ulBitOff += 1;
-            if (ulCode)
-            {
-                //            (*iDCPredictor) |= iPositive;  // in case the scan is run more than once
-                //            pMCU[0] = *iDCPredictor; // store in MCU[0]
-                if (pMCU)
-                    pMCU[0] |= iPositive;
-            }
-            goto mcu_done; // that's it
-        }
-        // get the DC component
-        ulCode = (ulBits >> (REGISTER_WIDTH - 12 - ulBitOff)) & 0xfff; // get as lower 12 bits
-        if (ulCode >= 0xf80) // long code
-            ulCode = (ulCode & 0xff); // point to long table
-        else
-            ulCode >>= 6; // use first 6 bits of short code
-        pFastDC = &pJPEG->ucHuffDC[pJPEG->ucDCTable * DC_TABLE_SIZE];
-        ucHuff = pFastDC[ulCode]; // get the length+code
-        if (ucHuff == 0) // invalid code
-            return -1;
-        ulBitOff += (ucHuff >> 4); // add the Huffman length
-        ucHuff &= 0xf; // get the actual code (SSSS)
-        if (ucHuff) // if there is a change to the DC value
-        { // get the 'extra' bits
-            if (ulBitOff > (REGISTER_WIDTH - 17)) // need to get more data
-            {
-                pBuf += (ulBitOff >> 3);
-                ulBitOff &= 7;
-                ulBits = MOTOLONG(pBuf);
-            }
-            ulCode = ulBits << ulBitOff;
-            ulTemp = ~(my_ulong)(((my_long)ulCode)>>(REGISTER_WIDTH-1)); // slide sign bit across other 63/31 bits
-            ulCode >>= (REGISTER_WIDTH - ucHuff);
-            ulCode -= ulTemp>>(REGISTER_WIDTH-ucHuff);
-            ulBitOff += ucHuff; // add bit length
-            ulCode <<= pJPEG->cApproxBitsLow; // successive approximation shift value
-            (*iDCPredictor) += ulCode;
-        }
-        if (pMCU)
-            pMCU[0] = (short)*iDCPredictor; // store in MCU[0]
-    }
-    // Now get the other 63 AC coefficients
-    pFast = &pJPEG->usHuffAC[pJPEG->ucACTable * HUFF11SIZE];
-    if (pJPEG->iScanStart)
-        iIndex = pJPEG->iScanStart; // starting index of this scan (progressive JPEG)
-    else
-        iIndex = 1; // special case when the DC component is included
-    if (pJPEG->cApproxBitsHigh) // successive approximation - different method
-    {
-        if (1)
-//        if (*iSkip == 0) // only decode this block if not being skipped in EOB run
-        {
-            for (; iIndex <= pJPEG->iScanEnd; iIndex++)
-            {
-                if (ulBitOff > (REGISTER_WIDTH-17)) { // need to get more data
-                    pBuf += (ulBitOff >> 3);
-                    ulBitOff &= 7;
-                    ulBits = MOTOLONG(pBuf);
-                }
-                ulCode = (ulBits >> (REGISTER_WIDTH - 16 - ulBitOff)) & 0xffff; // get as lower 16 bits
-                if (ulCode >= 0xf000) // first 4 bits = 1, use long table
-                    ulCode = (ulCode & 0x1fff);
-                else
-                    ulCode >>= 4; // use lower 12 bits (short table)
-                usHuff = pFast[ulCode];
-                if (usHuff == 0) // invalid code
-                    return -1;
-                ulBitOff += (usHuff >> 8); // add length
-                usHuff &= 0xff; // get code (RRRR/SSSS)
-                iCoeff = 0;
-                if (usHuff & 0xf)
-                {
-                    if ((usHuff & 0xf) != 1)   // size of new coefficient should always be one
-                        return -1;
-                    ulCode = (ulBits >> (REGISTER_WIDTH-1-ulBitOff)) & 1; // just get 1 bit
-                    ulBitOff += 1;
-                    if (ulCode) // 1 means use positive value; 0 = use negative
-                        iCoeff = iPositive;
-                    else
-                        iCoeff = iNegative;
-                }
-                else // since SSSS = 0, must be a ZRL or EOBn code
-                {
-                    if (usHuff != 0xf0) // ZRL
-                    { // EOBn code
-                        usHuff = (usHuff >> 4); // get the number of extra bits needed to code the count
-                        ulCode = ulBits >> (REGISTER_WIDTH - usHuff - ulBitOff); // shift down by (SSSS) - extra length
-                        ulCode &= iBitMasks[usHuff];
-                        ulCode += (1 << usHuff); // plus base amount
-                        ulBitOff += usHuff; // add extra length
-                        //*iSkip = ulCode; // return this skip amount
-                        break;
-                    }
-                }
-                // Advance over already-nonzero coefficients and RRRR still-zero coefficients
-                // appending correction bits to the nonzeroes.  A correction bit is 1 if the abs
-                // value of the coefficient must be increased.
-                iCount = (usHuff >> 4); // get RRRR in lower 4 bits
-                do {
-                    if (pMCU && pMCU[iIndex]) // a skipped block's coefficients are treated as zero
-                    {
-                        if (ulBitOff > (REGISTER_WIDTH-17)) { // need to get more data
-                            pBuf += (ulBitOff >> 3);
-                            ulBitOff &= 7;
-                            ulBits = MOTOLONG(pBuf);
-                        }
-                        ulCode = (ulBits >> (REGISTER_WIDTH-1-ulBitOff)) & 1; // just get 1 bit
-                        ulBitOff++;
-                        if (ulCode)
-                        {
-                            if ((pMCU[iIndex] & iPositive) == 0) // only combine if not already done
-                            {
-                                if (pMCU[iIndex] >= 0)
-                                    pMCU[iIndex] += (short)iPositive;
-                                else
-                                    pMCU[iIndex] += (short)iNegative;
-                            }
-                        }
-                    }
-                    else // count the zero coeffs to skip
-                    {
-                        if (--iCount < 0)
-                            break;      // done skipping zeros
-                    }
-                    iIndex++;
-                } while (iIndex <= pJPEG->iScanEnd);
-                if (iCoeff && iIndex < 0x40 && pMCU) // store the non-zero coefficient
-                    pMCU[iIndex] = (short) iCoeff;
-            } // for - AC coeffs
-        } // if not skipped
-        if (0)
-//        if (*iSkip) // scan any remaining coefficient positions after the end-of-band
-        {
-            for (; iIndex <= pJPEG->iScanEnd; iIndex++)
-            {
-                if (pMCU[iIndex]) // only non-zero ones need correction
-                {
-                    if (ulBitOff > 15) // need to grab more bytes to nibble on
-                    {
-                        pBuf += 2; // grab 2 more bytes since that's what we really need
-                        ulBitOff -= 16;
-                        ulBits <<= 16;
-                        ulBits |= MOTOSHORT(&pBuf[2]);
-                    }
-                    ulCode = ulBits >> (REGISTER_WIDTH - 1 - ulBitOff); // get 1 bit
-                    ulBitOff++;
-                    if (ulCode & 1)   // correction bit
-                    {
-                        if ((pMCU[iIndex] & iPositive) == 0) // only combine if not already done
-                        {
-                            if (pMCU[iIndex] >= 0)
-                                pMCU[iIndex] += (short)iPositive;
-                            else
-                                pMCU[iIndex] += (short)iNegative;
-                        }
-                    }  // if correction bit
-                }  // if coeff is non-zero
-            } // for the rest of the AC coefficients
-         //   (*iSkip)--; // count this block as completed
-        }  // if this block is being skipped
-    } // if successive approx
-    else // normal AC decoding
-    {
-       // if (*iSkip == 0) // if this block is not being skipped in a EOB run
-        {
-            while (iIndex <= pJPEG->iScanEnd)
-            {
-                if (ulBitOff > 15) // need to grab more bytes to nibble on
-                {
-                    pBuf += 2; // grab 2 more bytes since that's what we really need
-                    ulBitOff -= 16;
-                    ulBits <<= 16;
-                    ulBits |= MOTOSHORT(&pBuf[2]);
-                }
-                ulCode = (ulBits >> (REGISTER_WIDTH - 16 - ulBitOff)) & 0xffff; // get as lower 16 bits
-                if (ulCode >= 0xf000) // first 4 bits = 1, use long table
-                    ulCode = (ulCode & 0x1fff);
-                else
-                    ulCode >>= 4; // use lower 12 bits (short table)
-                usHuff = pFast[ulCode];
-                if (usHuff == 0) // invalid code
-                    return -1;
-                ulBitOff += (usHuff >> 8); // add length
-                usHuff &= 0xff; // get code (RRRR/SSSS)
-                //            if (usHuff == 0) // no more AC components
-                //               {
-                //               goto mcu_done;
-                //               }
-                if (usHuff == 0xf0) // is it ZRL?
-                {
-                    iIndex += 16; // skip 16 AC coefficients
-                }
-                else
-                {
-                    if (ulBitOff > 15)
-                    {
-                        pBuf += 2; // grab 2 more bytes since that's what we really need
-                        ulBitOff -= 16;
-                        ulBits <<= 16;
-                        ulBits |= MOTOSHORT(&pBuf[2]);
-                    }
-                    if ((usHuff & 0xf) == 0) // special case for encoding EOB (end-of-band) codes (SSSS=0)
-                    {
-                        usHuff = (usHuff >> 4); // get the number of extra bits needed to code the count
-                        ulCode = ulBits >> (REGISTER_WIDTH - usHuff - ulBitOff); // shift down by (SSSS) - extra length
-                        ulCode &= iBitMasks[usHuff];
-                        ulCode += (1 << usHuff); // plus base amount
-                        ulBitOff += usHuff; // add extra length
-                       // *iSkip = ulCode; // return this skip amount
-                        break;
-                    }
-                    else
-                    {
-                        iIndex += (usHuff >> 4); // skip amount
-                        usHuff &= 0xf; // get (SSSS) - extra length
-                        ulCode = ulBits << ulBitOff;
-                        ulCode >>= (32 - usHuff);
-                        if (!(ulCode & 0x80000000>>(REGISTER_WIDTH - 16 - -usHuff))) // test for negative
-                            ulCode -= 0xffffffff>>(REGISTER_WIDTH - 16 - -usHuff);
-                        ulBitOff += usHuff; // add (SSSS) extra length
-                        ulCode <<= pJPEG->cApproxBitsLow; // successive approximation shift value
-                        if (pMCU)
-                            pMCU[iIndex] = (signed short)ulCode; // store AC coefficient
-                        iIndex++;
-                    }
-                }
-            } // while
-        } // if this block not skipped
-    //    if (*iSkip)
-    //        (*iSkip)--; // count this block as being completed (or skipped)
-    } // end of non-successive approx code
-mcu_done:
-    pJPEG->bb.pBuf = pBuf;
-    pJPEG->iVLCOff = (int)(pBuf - pJPEG->ucFileBuf);
-    pJPEG->bb.ulBitOff = ulBitOff;
-    pJPEG->bb.ulBits = ulBits;
-    return 0;
+    iTableOffset = iTable * DCTSIZE;
+    p = (uint16_t *)&pJPEG->sQuantTable[iTableOffset];
+    for (i=0; i<DCTSIZE; i++)
+        sTemp[i] = p[cZigZag[i]];
+    memcpy(&pJPEG->sQuantTable[iTableOffset], sTemp, DCTSIZE*sizeof(short)); // copy back to original spot
     
-} /* JPEGDecodeMCU_P() */
+    // Prescale for DCT multiplication
+    p = (uint16_t *)&pJPEG->sQuantTable[iTableOffset];
+    for (i=0; i<DCTSIZE; i++)
+    {
+        p[i] = (uint16_t)((p[i] * iScaleBits[i]) >> 12);
+    }
+} /* JPEGFixQuantTable() */
+
+static void JPEGFixQuantD(JPEGIMAGE *pJPEG)
+{
+    int iTable;
+    
+    for (iTable=0; iTable<pJPEG->ucNumComponents; iTable++)
+        JPEGFixQuantTable(pJPEG, iTable);
+} /* JPEGFixQuantD() */
+//
+// Progressive JPEG
+//
+// A progressive image comes in a series of scans. Each adds coefficients, or more bits of them, to every block
+// of one or more components, so nothing can be drawn until the last scan is done. The scans are decoded as
+// their input arrives into a buffer that holds the coefficients of the whole image, and the image is drawn
+// from that buffer by JPEGDecodeRows() as it draws a baseline image.
+//
+// The Huffman tables of a progressive image are kept in usHuffAC: DC tables 0-1, then AC tables 0-1. Each has a
+// lookup of the codes up to HUFFP_LOOKUP_BITS long, giving length << 8 | value (0 for a longer code), then the
+// first code, number of codes and index of the first value of each code length, then the values.
+//
+#define HUFFP_LOOKUP_BITS 9
+#define HUFFP_MINCODE (1 << HUFFP_LOOKUP_BITS)
+#define HUFFP_COUNT (HUFFP_MINCODE + 17)
+#define HUFFP_VALOFF (HUFFP_COUNT + 17)
+#define HUFFP_VALUES (HUFFP_VALOFF + 17)
+#define HUFFP_SIZE 1024 // HUFFP_VALUES + 256 values, and 4 tables fill usHuffAC
+
+static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG)
+{
+    int iTable, iLen, iCount, iCode, iValue, i;
+    uint8_t *pBits;
+    uint16_t *pTable, usEntry;
+
+    for (iTable = 0; iTable < 8; iTable++) // DC tables 0-3, then AC tables 0-3
+    {
+        // Only tables 0 and 1 have room; a scan that uses another is refused
+        if (!(pJPEG->ucHuffTableUsed & (1 << iTable)) || (iTable & 3) > 1)
+            continue;
+        pTable = &pJPEG->usHuffAC[((iTable >> 2) * 2 + (iTable & 3)) * HUFFP_SIZE];
+        pBits = &((uint8_t *)pJPEG->usPixels)[iTable * HUFF_TABLEN]; // as JPEGGetHuffTables() left it
+        memset(pTable, 0, HUFFP_MINCODE * sizeof(uint16_t));
+        iCode = iValue = 0;
+        for (iLen = 1; iLen <= 16; iLen++)
+        {
+            iCount = pBits[iLen-1];
+            if (iCode + iCount > (1 << iLen)) // more codes than fit in this length
+                return 0;
+            pTable[HUFFP_MINCODE + iLen] = (uint16_t)iCode;
+            pTable[HUFFP_COUNT + iLen] = (uint16_t)iCount;
+            pTable[HUFFP_VALOFF + iLen] = (uint16_t)iValue;
+            for (; iCount; iCount--, iCode++, iValue++)
+            {
+                pTable[HUFFP_VALUES + iValue] = pBits[16 + iValue];
+                if (iLen <= HUFFP_LOOKUP_BITS) // fill every lookup entry that starts with this code
+                {
+                    usEntry = (uint16_t)((iLen << 8) | pBits[16 + iValue]);
+                    for (i = 0; i < (1 << (HUFFP_LOOKUP_BITS - iLen)); i++)
+                        pTable[(iCode << (HUFFP_LOOKUP_BITS - iLen)) + i] = usEntry;
+                }
+            }
+            iCode <<= 1;
+        }
+    }
+    return 1;
+} /* JPEGMakeHuffTablesP() */
+//
+// The bit reader of a progressive scan. Each read first makes sure at least 17 bits are loaded.
+//
+static inline void JPEGFillBitsP(BUFFERED_BITS *pBB)
+{
+    if (pBB->ulBitOff > (REGISTER_WIDTH-17))
+    {
+        pBB->pBuf += (pBB->ulBitOff >> 3);
+        pBB->ulBitOff &= 7;
+        pBB->ulBits = MOTOLONG(pBB->pBuf);
+    }
+} /* JPEGFillBitsP() */
+
+static inline uint32_t JPEGGetBitsP(BUFFERED_BITS *pBB, int iCount) // 1 to 16 bits
+{
+    uint32_t u;
+
+    JPEGFillBitsP(pBB);
+    u = (uint32_t)((pBB->ulBits << pBB->ulBitOff) >> (REGISTER_WIDTH - iCount));
+    pBB->ulBitOff += iCount;
+    return u;
+} /* JPEGGetBitsP() */
+//
+// Read a Huffman code; returns its value, or -1 for a code that is not in the table
+//
+static inline int JPEGHuffP(BUFFERED_BITS *pBB, const uint16_t *pTable)
+{
+    uint32_t u, uCode;
+    int iLen;
+
+    JPEGFillBitsP(pBB);
+    uCode = (uint32_t)((pBB->ulBits << pBB->ulBitOff) >> (REGISTER_WIDTH - 16)); // the next 16 bits
+    u = pTable[uCode >> (16 - HUFFP_LOOKUP_BITS)];
+    if (u) // a short code
+    {
+        pBB->ulBitOff += (u >> 8);
+        return (int)(u & 0xff);
+    }
+    for (iLen = HUFFP_LOOKUP_BITS+1; iLen <= 16; iLen++)
+    {
+        u = (uCode >> (16 - iLen)) - pTable[HUFFP_MINCODE + iLen]; // unsigned, so a code below the first is too big
+        if (u < pTable[HUFFP_COUNT + iLen])
+        {
+            pBB->ulBitOff += iLen;
+            return pTable[HUFFP_VALUES + pTable[HUFFP_VALOFF + iLen] + u];
+        }
+    }
+    return -1;
+} /* JPEGHuffP() */
+//
+// The value of a coefficient of iCount bits; a leading 0 bit makes it negative
+//
+static inline int JPEGExtendP(uint32_t u, int iCount)
+{
+    return (u < (1u << (iCount-1))) ? (int)u - (1 << iCount) + 1 : (int)u;
+} /* JPEGExtendP() */
+//
+// The coefficients of a block of a component (in natural order), or NULL when the component is not kept
+//
+static int16_t *JPEGBlockP(JPEGIMAGE *pJPEG, int iComp, int bx, int by)
+{
+    if (pJPEG->iCoefOffset[iComp] < 0)
+        return NULL;
+    return &pJPEG->pCoefs[((size_t)pJPEG->iCoefOffset[iComp] + (size_t)by * pJPEG->iCoefPitch[iComp] + bx) * pJPEG->iCoefStride];
+} /* JPEGBlockP() */
+
+static int *JPEGDCPredP(JPEGIMAGE *pJPEG, int iComp)
+{
+    return (iComp == 0) ? &pJPEG->iDCPred0 : (iComp == 1) ? &pJPEG->iDCPred1 : &pJPEG->iDCPred2;
+} /* JPEGDCPredP() */
+//
+// Decode what the current scan holds of a block into pCoef. pCoef is NULL for a block of a component that is
+// not kept, which only a DC scan of several components decodes.
+// Returns 0 for success, -1 for bad data.
+//
+static int JPEGDecodeBlockP(JPEGIMAGE *pJPEG, int16_t *pCoef, int *piDCPred, const uint16_t *pDCTable, const uint16_t *pACTable)
+{
+    BUFFERED_BITS bb = pJPEG->bb; // a local copy that the compiler can keep in registers
+    int k, n, r, s, iEnd = pJPEG->iScanEnd;
+    int p1 = 1 << pJPEG->cApproxBitsLow, m1 = -p1; // the bit of the coefficients that this scan adds
+
+    if (pJPEG->iScanStart == 0) // DC
+    {
+        if (pJPEG->cApproxBitsHigh == 0) // first scan: the difference from the DC of the last block
+        {
+            s = JPEGHuffP(&bb, pDCTable);
+            if (s < 0 || s > 11)
+                goto bad_data;
+            if (s) // unsigned, so that bad data cannot overflow it
+                *piDCPred = (int)((unsigned)*piDCPred + (unsigned)JPEGExtendP(JPEGGetBitsP(&bb, s), s));
+            if (pCoef)
+                pCoef[0] = (int16_t)((unsigned)*piDCPred * (unsigned)p1);
+        }
+        else if (JPEGGetBitsP(&bb, 1) && pCoef) // refinement: one more bit
+        {
+            pCoef[0] |= p1;
+        }
+    }
+    else if (pJPEG->cApproxBitsHigh == 0) // first scan of these AC coefficients
+    {
+        if (pJPEG->iEOBRun) // in a run of blocks that have none
+        {
+            pJPEG->iEOBRun--;
+        }
+        else
+        {
+            for (k = pJPEG->iScanStart; k <= iEnd; k++)
+            {
+                s = JPEGHuffP(&bb, pACTable);
+                if (s < 0)
+                    goto bad_data;
+                r = s >> 4;
+                s &= 15;
+                if (s) // r zeros, then a coefficient of s bits
+                {
+                    k += r;
+                    if (k > 63)
+                        goto bad_data;
+                    pCoef[cZigZag2[k]] = (int16_t)(JPEGExtendP(JPEGGetBitsP(&bb, s), s) * p1);
+                }
+                else if (r == 15) // sixteen zeros
+                {
+                    k += 15;
+                }
+                else // the end of the band in this block, and in the next ones of the run
+                {
+                    pJPEG->iEOBRun = (1 << r) - 1;
+                    if (r)
+                        pJPEG->iEOBRun += JPEGGetBitsP(&bb, r);
+                    break;
+                }
+            }
+        }
+    }
+    else // refinement of these AC coefficients
+    {
+        k = pJPEG->iScanStart;
+        if (pJPEG->iEOBRun == 0)
+        {
+            for (; k <= iEnd; k++)
+            {
+                s = JPEGHuffP(&bb, pACTable);
+                if (s < 0)
+                    goto bad_data;
+                r = s >> 4;
+                s &= 15;
+                if (s) // a coefficient that becomes nonzero, with a size of 1
+                {
+                    if (s != 1)
+                        goto bad_data;
+                    s = JPEGGetBitsP(&bb, 1) ? p1 : m1;
+                }
+                else if (r != 15) // the end of the band; what is left of it is refined below
+                {
+                    pJPEG->iEOBRun = 1 << r;
+                    if (r)
+                        pJPEG->iEOBRun += JPEGGetBitsP(&bb, r);
+                    break;
+                }
+                // Pass over r coefficients that are still zero, refining the nonzero ones on the way
+                for (; k <= iEnd; k++)
+                {
+                    n = cZigZag2[k];
+                    if (pCoef[n])
+                    {
+                        if (JPEGGetBitsP(&bb, 1) && (pCoef[n] & p1) == 0)
+                            pCoef[n] += (pCoef[n] >= 0) ? p1 : m1;
+                    }
+                    else if (--r < 0)
+                    {
+                        break;
+                    }
+                }
+                if (s)
+                {
+                    if (k > 63)
+                        goto bad_data;
+                    pCoef[cZigZag2[k]] = (int16_t)s;
+                }
+            }
+        }
+        if (pJPEG->iEOBRun) // in a run of blocks with no new coefficients: refine the nonzero ones
+        {
+            for (; k <= iEnd; k++)
+            {
+                n = cZigZag2[k];
+                if (pCoef[n] && JPEGGetBitsP(&bb, 1) && (pCoef[n] & p1) == 0)
+                    pCoef[n] += (pCoef[n] >= 0) ? p1 : m1;
+            }
+            pJPEG->iEOBRun--;
+        }
+    }
+    pJPEG->bb = bb;
+    return 0;
+bad_data:
+    pJPEG->bb = bb; // how far it got tells bad data from a file that was cut short
+    return -1;
+} /* JPEGDecodeBlockP() */
+//
+// Decode an MCU of a DC scan of several components
+//
+static int JPEGDecodeMCUP(JPEGIMAGE *pJPEG, int x, int y)
+{
+    int iComp, h, v;
+    JPEGCOMPINFO *pComp;
+
+    for (iComp = 0; iComp < pJPEG->ucNumComponents; iComp++)
+    {
+        pComp = &pJPEG->JPCI[iComp];
+        if (!pComp->component_needed)
+            continue;
+        for (v = 0; v < pComp->v_samp_factor; v++)
+        {
+            for (h = 0; h < pComp->h_samp_factor; h++)
+            {
+                if (JPEGDecodeBlockP(pJPEG, JPEGBlockP(pJPEG, iComp, x * pComp->h_samp_factor + h, y * pComp->v_samp_factor + v),
+                                     JPEGDCPredP(pJPEG, iComp), &pJPEG->usHuffAC[pComp->dc_tbl_no * HUFFP_SIZE], NULL))
+                    return -1;
+            }
+        }
+    }
+    return 0;
+} /* JPEGDecodeMCUP() */
+//
+// Remove the stuffed zeros and restart markers from the data of a scan as JPEGFilter() does, but stop at any
+// other marker, which ends the scan, and leave a final FF until the byte after it has been read.
+// Returns the length of the filtered data, and sets *piUsed to the input bytes used.
+//
+static int JPEGFilterP(uint8_t *s, uint8_t *d, int iLen, int *piUsed, uint8_t *pucMarker)
+{
+    uint8_t *pIn = s, *pOut = d, *pEnd = &s[iLen];
+
+    while (s < pEnd)
+    {
+        if (*s != 0xff)
+        {
+            *d++ = *s++;
+        }
+        else if (s + 1 == pEnd) // what follows the FF is not here yet
+        {
+            break;
+        }
+        else if (s[1] == 0) // stuffed zero
+        {
+            *d++ = 0xff;
+            s += 2;
+        }
+        else if (s[1] >= 0xd0 && s[1] <= 0xd7) // restart marker
+        {
+            s += 2;
+        }
+        else if (s[1] == 0xff) // fill byte before a marker
+        {
+            s++;
+        }
+        else // the marker after the scan
+        {
+            *pucMarker = 1;
+            break;
+        }
+    }
+    *piUsed = (int)(s - pIn);
+    return (int)(d - pOut);
+} /* JPEGFilterP() */
+//
+// Read and filter more of a scan's data. The data not yet decoded and the input after it move to the start of
+// the buffer first, and the bit reader with them. Returns the number of bytes read.
+//
+static int JPEGGetMoreDataP(JPEGIMAGE *pJPEG)
+{
+    uint8_t *pBuf = pJPEG->ucFileBuf;
+    int iOff, iLen, iRawLen, iRead = 0, iUsed;
+
+    pJPEG->bb.pBuf += (pJPEG->bb.ulBitOff >> 3); // a whole byte, which can move
+    pJPEG->bb.ulBitOff &= 7;
+    iOff = (int)(pJPEG->bb.pBuf - pBuf);
+    if (iOff > pJPEG->iVLCSize) // bad data took the bit reader past the end
+        iOff = pJPEG->iVLCSize;
+    iLen = pJPEG->iVLCSize - iOff;
+    iRawLen = pJPEG->iRawSize - pJPEG->iRawOff;
+    memmove(pBuf, &pBuf[iOff], iLen);
+    memmove(&pBuf[iLen], &pBuf[pJPEG->iRawOff], iRawLen);
+    pJPEG->bb.pBuf = pBuf;
+    pJPEG->iVLCOff = 0;
+    pJPEG->iVLCSize = pJPEG->iRawOff = iLen;
+    pJPEG->iRawSize = iLen + iRawLen;
+    if (!pJPEG->ucScanMarker) // the scan's data goes on
+    {
+        if (pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize && pJPEG->iRawSize < JPEG_FILE_BUF_SIZE)
+        {
+            iRead = (*pJPEG->pfnRead)(&pJPEG->JPEGFile, &pBuf[pJPEG->iRawSize], JPEG_FILE_BUF_SIZE - pJPEG->iRawSize);
+            if (iRead < 0)
+                iRead = 0;
+            pJPEG->iRawSize += iRead;
+        }
+        pJPEG->iVLCSize += JPEGFilterP(&pBuf[pJPEG->iRawOff], &pBuf[pJPEG->iVLCSize], pJPEG->iRawSize - pJPEG->iRawOff, &iUsed, &pJPEG->ucScanMarker);
+        pJPEG->iRawOff += iUsed;
+        if (!pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos >= pJPEG->JPEGFile.iSize) // the file ends before the scan
+            memset(&pBuf[pJPEG->iVLCSize], 0, JPEG_FILE_BUF_SIZE - pJPEG->iVLCSize); // its last block reads zeros
+    }
+    pJPEG->bb.ulBits = MOTOLONG(pBuf);
+    return iRead;
+} /* JPEGGetMoreDataP() */
+//
+// Whole bytes of the scan's filtered data that the bit reader has not reached
+//
+static int JPEGBytesLeftP(JPEGIMAGE *pJPEG)
+{
+    return pJPEG->iVLCSize - (int)(pJPEG->bb.pBuf - pJPEG->ucFileBuf) - (int)(pJPEG->bb.ulBitOff >> 3);
+} /* JPEGBytesLeftP() */
+//
+// Start the scan whose header JPEGGetSOS() just read; its data starts at iRawOff
+// Returns 1 for success, 0 for failure
+//
+static int JPEGStartScanP(JPEGIMAGE *pJPEG)
+{
+    int i, iComp = 0, iCount = 0, iHMax, iVMax;
+    JPEGCOMPINFO *pComp;
+
+    // A DC scan can have several components, an AC scan only one
+    if ((pJPEG->iScanStart == 0) ? (pJPEG->iScanEnd != 0) :
+        (pJPEG->iScanEnd < pJPEG->iScanStart || pJPEG->iScanEnd > 63 || pJPEG->ucComponentsInScan != 1))
+    {
+        pJPEG->iError = JPEG_DECODE_ERROR;
+        return 0;
+    }
+    // A refinement scan adds the bit below the ones there are
+    if (pJPEG->cApproxBitsLow > 13 || (pJPEG->cApproxBitsHigh != 0 && pJPEG->cApproxBitsLow != pJPEG->cApproxBitsHigh - 1))
+    {
+        pJPEG->iError = JPEG_DECODE_ERROR;
+        return 0;
+    }
+    for (i = 0; i < pJPEG->ucNumComponents; i++)
+    {
+        pComp = &pJPEG->JPCI[i];
+        if (!pComp->component_needed)
+            continue;
+        if (((pJPEG->iScanStart == 0) ? pComp->dc_tbl_no : pComp->ac_tbl_no) > 1) // only tables 0 and 1 have room
+        {
+            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+            return 0;
+        }
+        iComp = i;
+        iCount++;
+    }
+    if (iCount == 0 || iCount != pJPEG->ucComponentsInScan) // a component that is not in the frame
+    {
+        pJPEG->iError = JPEG_DECODE_ERROR;
+        return 0;
+    }
+    iHMax = pJPEG->JPCI[0].h_samp_factor; // the luma blocks are the most
+    iVMax = pJPEG->JPCI[0].v_samp_factor;
+    pJPEG->iScanX = pJPEG->iScanY = 0;
+    pJPEG->ucScanComp = (uint8_t)iComp;
+    if (iCount > 1) // whole MCUs
+    {
+        pJPEG->iScanCX = (pJPEG->iWidth + iHMax*8 - 1) / (iHMax*8);
+        pJPEG->iScanCY = (pJPEG->iHeight + iVMax*8 - 1) / (iVMax*8);
+    }
+    else // only the blocks of the component that cover the image, not whole MCUs
+    {
+        pComp = &pJPEG->JPCI[iComp];
+        pJPEG->iScanCX = ((pJPEG->iWidth * pComp->h_samp_factor + iHMax - 1) / iHMax + 7) >> 3;
+        pJPEG->iScanCY = ((pJPEG->iHeight * pComp->v_samp_factor + iVMax - 1) / iVMax + 7) >> 3;
+    }
+    pJPEG->iEOBRun = 0;
+    pJPEG->iDCPred0 = pJPEG->iDCPred1 = pJPEG->iDCPred2 = 0;
+    pJPEG->iResCount = pJPEG->iResInterval;
+    // Pass over a scan of a component that is not kept, and AC scans when only the DC is kept
+    if ((iCount == 1 && pJPEG->iCoefOffset[iComp] < 0) || (pJPEG->iScanStart && pJPEG->iCoefStride == 1))
+        pJPEG->ucProgState = JPEG_PROG_SKIP;
+    else
+        pJPEG->ucProgState = JPEG_PROG_SCAN;
+    pJPEG->ucScanMarker = 0;
+    pJPEG->iVLCOff = pJPEG->iVLCSize = 0;
+    pJPEG->bb.pBuf = pJPEG->ucFileBuf;
+    pJPEG->bb.ulBitOff = 0;
+    JPEGGetMoreDataP(pJPEG);
+    return 1;
+} /* JPEGStartScanP() */
+//
+// A scan is finished, or its data ran out: what is left of the data goes, and the markers after it are next
+//
+static void JPEGEndScanP(JPEGIMAGE *pJPEG)
+{
+    pJPEG->iVLCOff = pJPEG->iVLCSize;
+    pJPEG->ucProgState = JPEG_PROG_HEADER;
+} /* JPEGEndScanP() */
+//
+// Move the input between scans to the start of the buffer and read more after it; returns the bytes read
+//
+static int JPEGReadRawP(JPEGIMAGE *pJPEG)
+{
+    int iLen = pJPEG->iRawSize - pJPEG->iRawOff, iRead = 0;
+
+    memmove(pJPEG->ucFileBuf, &pJPEG->ucFileBuf[pJPEG->iRawOff], iLen);
+    pJPEG->iRawOff = 0;
+    pJPEG->iRawSize = iLen;
+    if (pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize && iLen < JPEG_FILE_BUF_SIZE)
+    {
+        iRead = (*pJPEG->pfnRead)(&pJPEG->JPEGFile, &pJPEG->ucFileBuf[iLen], JPEG_FILE_BUF_SIZE - iLen);
+        if (iRead < 0)
+            iRead = 0;
+        pJPEG->iRawSize += iRead;
+    }
+    return iRead;
+} /* JPEGReadRawP() */
+//
+// Read the markers after a scan, up to the next scan or the end of the image
+// Returns 1 when it got there, JPEG_DECODE_NEED_DATA when waiting for input and 0 on error
+//
+static int JPEGReadMarkersP(JPEGIMAGE *pJPEG, int bCanPause)
+{
+    uint8_t *s, ucMarker;
+    int iAvail, iLen, iOff;
+
+    for (;;)
+    {
+        s = &pJPEG->ucFileBuf[pJPEG->iRawOff];
+        iAvail = pJPEG->iRawSize - pJPEG->iRawOff;
+        if (pJPEG->iSkipLen) // pass over the rest of a segment that is not needed
+        {
+            iOff = (pJPEG->iSkipLen < iAvail) ? pJPEG->iSkipLen : iAvail;
+            pJPEG->iRawOff += iOff;
+            pJPEG->iSkipLen -= iOff;
+            if (pJPEG->iSkipLen == 0)
+                continue;
+        }
+        else if (iAvail >= 2 && (s[0] != 0xff || s[1] == 0xff || s[1] == 0))
+        {
+            pJPEG->iRawOff++; // what is left of the scan's data, or fill bytes before a marker
+            continue;
+        }
+        else if (iAvail >= 2)
+        {
+            ucMarker = s[1];
+            if (ucMarker == 0xd9) // end of image
+            {
+                pJPEG->iRawOff += 2;
+                pJPEG->ucProgState = JPEG_PROG_DRAW;
+                return 1;
+            }
+            if ((ucMarker >= 0xd0 && ucMarker <= 0xd8) || ucMarker == 0x01) // markers without a segment
+            {
+                pJPEG->iRawOff += 2;
+                continue;
+            }
+            if (iAvail >= 4)
+            {
+                iLen = MOTOSHORT(&s[2]) + 2; // the marker and its segment
+                if (iLen < 4)
+                {
+                    pJPEG->iError = JPEG_DECODE_ERROR;
+                    return 0;
+                }
+                if (ucMarker != 0xc4 && ucMarker != 0xdb && ucMarker != 0xdd && ucMarker != 0xda) // not needed
+                {
+                    pJPEG->iSkipLen = iLen;
+                    continue;
+                }
+                if (iLen > JPEG_FILE_BUF_SIZE) // too long to hold
+                {
+                    pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+                    return 0;
+                }
+                if (iAvail >= iLen) // the whole segment is here
+                {
+                    switch (ucMarker)
+                    {
+                        case 0xc4: // Huffman tables
+                            if (JPEGGetHuffTables(&s[4], iLen - 4, pJPEG) != 0 || !JPEGMakeHuffTablesP(pJPEG))
+                            {
+                                pJPEG->iError = JPEG_DECODE_ERROR;
+                                return 0;
+                            }
+                            break;
+                        case 0xdb: // quantization tables
+                            if (JPEGGetQuantTables(pJPEG, &s[4], iLen - 4, 1) != 0)
+                            {
+                                pJPEG->iError = JPEG_DECODE_ERROR;
+                                return 0;
+                            }
+                            break;
+                        case 0xdd: // restart interval
+                            if (iLen == 6)
+                                pJPEG->iResInterval = MOTOSHORT(&s[4]);
+                            break;
+                        case 0xda: // start of the next scan
+                            iOff = pJPEG->iRawOff + 2;
+                            if (JPEGGetSOS(pJPEG, &iOff) != 0)
+                            {
+                                pJPEG->iError = JPEG_DECODE_ERROR;
+                                return 0;
+                            }
+                            pJPEG->iRawOff = iOff;
+                            return JPEGStartScanP(pJPEG);
+                    }
+                    pJPEG->iRawOff += iLen;
+                    continue;
+                }
+            }
+        }
+        // More input is needed
+        if (JPEGReadRawP(pJPEG) > 0)
+            continue;
+        if (pJPEG->JPEGFile.iPos >= pJPEG->JPEGFile.iSize) // the file ended early; draw what there is
+        {
+            pJPEG->ucProgState = JPEG_PROG_DRAW;
+            return 1;
+        }
+        if (bCanPause)
+            return JPEG_DECODE_NEED_DATA;
+        pJPEG->iError = JPEG_DECODE_ERROR; // the read callback has nothing more
+        return 0;
+    }
+} /* JPEGReadMarkersP() */
+//
+// Decode the rest of the current row of MCUs of a scan, or row of blocks when it has one component
+// Returns 1 when done, JPEG_DECODE_NEED_DATA when waiting for input and 0 on error
+//
+static int JPEGDecodeScanRowP(JPEGIMAGE *pJPEG, int bCanPause)
+{
+    int x, iAvail, bMore, iErr;
+    int iComp = pJPEG->ucScanComp;
+    int *piDCPred = JPEGDCPredP(pJPEG, iComp);
+    const uint16_t *pDCTable = &pJPEG->usHuffAC[pJPEG->JPCI[iComp].dc_tbl_no * HUFFP_SIZE];
+    const uint16_t *pACTable = &pJPEG->usHuffAC[(2 + pJPEG->JPCI[iComp].ac_tbl_no) * HUFFP_SIZE];
+
+    for (x = pJPEG->iScanX; x < pJPEG->iScanCX; x++)
+    {
+        // Wait for input rather than decode past the end of what has arrived, as JPEGDecodeRows() does
+        iAvail = JPEGBytesLeftP(pJPEG);
+        bMore = !pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize; // more of the data to read
+        if (bMore && iAvail < JPEG_INPUT_MARGIN)
+        {
+            JPEGGetMoreDataP(pJPEG);
+            iAvail = JPEGBytesLeftP(pJPEG);
+            bMore = !pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize;
+            if (bMore && bCanPause && iAvail < JPEG_INPUT_MARGIN)
+            {
+                pJPEG->iScanX = x;
+                return JPEG_DECODE_NEED_DATA;
+            }
+        }
+        if (!bMore && iAvail <= 0) // the data ran out before the scan did
+        {
+            JPEGEndScanP(pJPEG);
+            return 1;
+        }
+        if (pJPEG->ucComponentsInScan > 1)
+            iErr = JPEGDecodeMCUP(pJPEG, x, pJPEG->iScanY);
+        else
+            iErr = JPEGDecodeBlockP(pJPEG, JPEGBlockP(pJPEG, iComp, x, pJPEG->iScanY), piDCPred, pDCTable, pACTable);
+        if (iErr)
+        {
+            if (!bMore && JPEGBytesLeftP(pJPEG) <= 0) // the data ran out part way through, as in a file cut short
+            {
+                JPEGEndScanP(pJPEG);
+                return 1;
+            }
+            pJPEG->iError = JPEG_DECODE_ERROR;
+            return 0;
+        }
+        if (pJPEG->iResInterval && --pJPEG->iResCount == 0) // the filter took out a restart marker here
+        {
+            pJPEG->iResCount = pJPEG->iResInterval;
+            pJPEG->iDCPred0 = pJPEG->iDCPred1 = pJPEG->iDCPred2 = 0;
+            pJPEG->iEOBRun = 0;
+            pJPEG->bb.ulBitOff = (pJPEG->bb.ulBitOff + 7) & ~7u; // the next interval starts on a whole byte
+        }
+    }
+    pJPEG->iScanX = 0;
+    if (++pJPEG->iScanY == pJPEG->iScanCY)
+        JPEGEndScanP(pJPEG);
+    return 1;
+} /* JPEGDecodeScanRowP() */
+//
+// Pass over the data of a scan that is not needed, a buffer at a time
+// Returns 1 when done, JPEG_DECODE_NEED_DATA when waiting for input and 0 on error
+//
+static int JPEGSkipScanP(JPEGIMAGE *pJPEG, int bCanPause)
+{
+    int iRead;
+
+    pJPEG->bb.pBuf = &pJPEG->ucFileBuf[pJPEG->iVLCSize]; // drop the data filtered so far
+    pJPEG->bb.ulBitOff = 0;
+    if (pJPEG->ucScanMarker || pJPEG->JPEGFile.iPos >= pJPEG->JPEGFile.iSize) // read up to its end
+    {
+        JPEGEndScanP(pJPEG);
+        return 1;
+    }
+    iRead = JPEGGetMoreDataP(pJPEG);
+    // A read that did not fill the buffer used up the input there is so far
+    if (!pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize && pJPEG->iRawSize < JPEG_FILE_BUF_SIZE)
+    {
+        if (bCanPause)
+            return JPEG_DECODE_NEED_DATA;
+        if (iRead == 0)
+        {
+            pJPEG->iError = JPEG_DECODE_ERROR; // the read callback has nothing more
+            return 0;
+        }
+    }
+    return 1;
+} /* JPEGSkipScanP() */
+//
+// Decode the scans of a progressive image into the coefficient buffer, using up *piRows rows of their MCUs or
+// blocks at most. Returns 1 once every scan is decoded, JPEG_DECODE_MORE when *piRows ran out first,
+// JPEG_DECODE_NEED_DATA when waiting for input and 0 on error.
+//
+static int JPEGDecodeScansP(JPEGIMAGE *pJPEG, int *piRows, int bCanPause)
+{
+    int i;
+
+    while (pJPEG->ucProgState != JPEG_PROG_DRAW)
+    {
+        if (pJPEG->ucProgState == JPEG_PROG_HEADER)
+        {
+            i = JPEGReadMarkersP(pJPEG, bCanPause);
+        }
+        else
+        {
+            if (*piRows < 1)
+                return JPEG_DECODE_MORE;
+            if (pJPEG->ucProgState == JPEG_PROG_SKIP)
+                i = JPEGSkipScanP(pJPEG, bCanPause);
+            else
+                i = JPEGDecodeScanRowP(pJPEG, bCanPause);
+            (*piRows)--;
+        }
+        if (i != 1)
+            return i;
+    }
+    return 1;
+} /* JPEGDecodeScansP() */
+//
+// Allocate the coefficient buffer of a progressive image and start its first scan, whose header was read when
+// the image was opened. Returns 1 for success, 0 for failure.
+//
+static int JPEGStartP(JPEGIMAGE *pJPEG)
+{
+    int i, cx, cy, iBlocks = 0;
+    size_t iSize;
+    JPEGCOMPINFO *pComp = pJPEG->JPCI;
+
+    // Grayscale, or color with 1 to 2x2 luma blocks to each chroma block, as JPEGDecodeRows() draws
+    if (pJPEG->ucNumComponents == 3)
+    {
+        if (pComp[0].h_samp_factor < 1 || pComp[0].h_samp_factor > 2 || pComp[0].v_samp_factor < 1 || pComp[0].v_samp_factor > 2 ||
+            pComp[1].h_samp_factor != 1 || pComp[1].v_samp_factor != 1 || pComp[2].h_samp_factor != 1 || pComp[2].v_samp_factor != 1)
+        {
+            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+            return 0;
+        }
+    }
+    else if (pJPEG->ucNumComponents != 1)
+    {
+        pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+        return 0;
+    }
+    cx = (pJPEG->iWidth + pComp[0].h_samp_factor*8 - 1) / (pComp[0].h_samp_factor*8); // MCUs
+    cy = (pJPEG->iHeight + pComp[0].v_samp_factor*8 - 1) / (pComp[0].v_samp_factor*8);
+    pJPEG->iCoefStride = (pJPEG->iOptions & JPEG_SCALE_EIGHTH) ? 1 : DCTSIZE; // 1/8 scale only draws the DC
+    for (i = 0; i < MAX_COMPS_IN_SCAN; i++)
+    {
+        pJPEG->iCoefOffset[i] = -1;
+        // Grayscale output only draws the luma
+        if (i >= pJPEG->ucNumComponents || (i > 0 && pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE))
+            continue;
+        pJPEG->iCoefOffset[i] = iBlocks;
+        pJPEG->iCoefPitch[i] = cx * pComp[i].h_samp_factor;
+        iBlocks += cx * pComp[i].h_samp_factor * cy * pComp[i].v_samp_factor;
+    }
+    if ((size_t)iBlocks > ((size_t)-1) / (pJPEG->iCoefStride * sizeof(int16_t)))
+    {
+        pJPEG->iError = JPEG_ERROR_MEMORY;
+        return 0;
+    }
+    iSize = (size_t)iBlocks * pJPEG->iCoefStride * sizeof(int16_t);
+    pJPEG->pCoefs = (int16_t *)JPEG_MALLOC(iSize);
+    if (pJPEG->pCoefs == NULL)
+    {
+        pJPEG->iError = JPEG_ERROR_MEMORY;
+        return 0;
+    }
+    memset(pJPEG->pCoefs, 0, iSize);
+    if (!JPEGStartScanP(pJPEG))
+    {
+        JPEGFreeP(pJPEG);
+        return 0;
+    }
+    return 1;
+} /* JPEGStartP() */
+
+static void JPEGFreeP(JPEGIMAGE *pJPEG)
+{
+    if (pJPEG->pCoefs)
+    {
+        JPEG_FREE(pJPEG->pCoefs);
+        pJPEG->pCoefs = NULL;
+    }
+} /* JPEGFreeP() */
+//
+// Get a block of a progressive image from the coefficient buffer into the MCU buffer, as JPEGDecodeMCU() leaves
+// a block that it decodes. iBlock is the block's place in MCU (x, y).
+//
+static void JPEGGetBlockP(JPEGIMAGE *pJPEG, int iMCU, int iComp, int x, int y, int iBlock, int *iDCPredictor)
+{
+    JPEGCOMPINFO *pComp = &pJPEG->JPCI[iComp];
+    int16_t *pCoef, *pMCU;
+    uint16_t u16MCUFlags = 0;
+    int i, n, iEnd;
+
+    pCoef = JPEGBlockP(pJPEG, iComp, x * pComp->h_samp_factor + (iBlock % pComp->h_samp_factor),
+                       y * pComp->v_samp_factor + (iBlock / pComp->h_samp_factor));
+    pJPEG->u16MCUFlags = 0;
+    *iDCPredictor = pCoef[0];
+    if (iMCU < 0 || pJPEG->iCoefStride == 1) // skipped, or only the DC is drawn
+        return;
+    pMCU = &pJPEG->sMCUs[iMCU];
+    if (pJPEG->iOptions & JPEG_SCALE_QUARTER) // only the first few coefficients are used
+    {
+        pMCU[0] = pCoef[0];
+        pMCU[1] = pMCU[8] = pMCU[9] = 0;
+        iEnd = 5;
+    }
+    else
+    {
+        memcpy(pMCU, pCoef, DCTSIZE * sizeof(int16_t));
+        iEnd = DCTSIZE;
+    }
+    for (i = 1; i < iEnd; i++) // mark the columns and rows with coefficients for the IDCT
+    {
+        n = cZigZag2[i];
+        if (pCoef[n])
+        {
+            pMCU[n] = pCoef[n];
+            u16MCUFlags |= 1<<(n & 7);
+            u16MCUFlags |= n << 8;
+        }
+    }
+    pJPEG->u16MCUFlags = u16MCUFlags;
+} /* JPEGGetBlockP() */
 //
 // Decode the DC and 2-63 AC coefficients of the current DCT block
 // For 1/4 and 1/8 scaled images, we don't store most of the AC values since we
@@ -2228,6 +2809,12 @@ static int JPEGDecodeMCU(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
             usHuff &= 0xf; // get (SSSS) - extra length
             if (pZig < pEnd2 && usHuff)
             {
+                if (ulBitOff > (REGISTER_WIDTH - 17)) // the code and its extra bits can be more than the bits loaded
+                {
+                    pBuf += (ulBitOff >> 3);
+                    ulBitOff &= 7;
+                    ulBits = MOTOLONG(pBuf);
+                }
                 ulCode = ulBits << ulBitOff;
                 ulTemp = ~(my_ulong) (((my_long) ulCode) >> (REGISTER_WIDTH-1)); // slide sign bit across other 63 bits
                 ulCode >>= (REGISTER_WIDTH - usHuff);
@@ -2274,6 +2861,12 @@ static int JPEGDecodeMCU(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
             usHuff &= 0xf; // get (SSSS) - extra length
             if (pZig < pEnd2 && usHuff)
             {
+                if (ulBitOff > (REGISTER_WIDTH - 17)) // the code and its extra bits can be more than the bits loaded
+                {
+                    pBuf += (ulBitOff >> 3);
+                    ulBitOff &= 7;
+                    ulBits = MOTOLONG(pBuf);
+                }
                 ulCode = ulBits << ulBitOff;
                 ulTemp = ~(my_ulong) (((my_long) ulCode) >> (REGISTER_WIDTH-1)); // slide sign bit across other 63 bits
                 ulCode >>= (REGISTER_WIDTH - usHuff);
@@ -4672,7 +5265,7 @@ static void JPEGPutMCU12(JPEGIMAGE *pJPEG, int x, int iPitch)
             JPEGPixelBE(pOutput, Y1, Cb, Cr);
             JPEGPixelBE(pOutput + iPitch, Y2, Cb, Cr);
         } else { // RGB8888
-            JPEGPixelRGB((uint32_t *)&pOutput, Y1, Cb, Cr);
+            JPEGPixelRGB((uint32_t *)pOutput, Y1, Cb, Cr);
             JPEGPixelRGB((uint32_t *)&pOutput[iPitch*2], Y2, Cb, Cr);
         }
         Y1 = pY[1] << 12;
@@ -5008,10 +5601,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
 static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
 {
     pJPEG->bDecodeActive = 0;
+    JPEGFreeP(pJPEG); // from a decode that did not finish
     // Requested the Exif thumbnail
-    if (pJPEG->ucMode == 0xc2) { // progressive mode - we only decode the first scan (DC values)
-        pJPEG->iOptions |= JPEG_SCALE_EIGHTH; // return 1/8 sized image
-    }
     if (pJPEG->iOptions & JPEG_EXIF_THUMBNAIL)
     {
         if (pJPEG->iThumbData == 0 || pJPEG->iThumbWidth == 0) // doesn't exist
@@ -5037,6 +5628,8 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
     pJPEG->iDCPred0 = pJPEG->iDCPred1 = pJPEG->iDCPred2 = 0;
     pJPEG->iDMAOffset = 0;
     pJPEG->pAlignedPixels = pJPEG->usPixels;
+    if (pJPEG->ucMode == 0xc2 && !JPEGStartP(pJPEG)) // progressive: the scans are decoded before drawing
+        return 0;
     pJPEG->bDecodeActive = 1;
     return 1;
 } /* JPEGDecodeStart() */
@@ -5044,6 +5637,8 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
 // Decode up to iRows more rows of MCUs, continuing where the last call stopped.
 // Returns JPEG_DECODE_MORE when rows remain, 1 when the image is finished (or
 // the draw callback asked to stop) and 0 on error.
+// A progressive image first decodes its scans, a row of MCUs or blocks of a
+// scan counting as a row, and then draws the rows.
 // With bCanPause, it also stops before an MCU when less than JPEG_INPUT_MARGIN
 // bytes of input are buffered and the read callback has no more yet, and
 // returns JPEG_DECODE_NEED_DATA; the next call resumes at that MCU.
@@ -5070,6 +5665,18 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     {
         pJPEG->iError = JPEG_INVALID_PARAMETER;
         return 0;
+    }
+    if (pJPEG->ucMode == 0xc2 && pJPEG->ucProgState != JPEG_PROG_DRAW)
+    {
+        i = JPEGDecodeScansP(pJPEG, &iRows, bCanPause);
+        if (i == 0)
+        {
+            pJPEG->bDecodeActive = 0;
+            JPEGFreeP(pJPEG);
+            return 0;
+        }
+        if (i != 1 || iRows < 1) // waiting for input, or no rows left to draw in this call
+            return (i == 1) ? JPEG_DECODE_MORE : i;
     }
     pAlignedPixels = pJPEG->pAlignedPixels;
     // Fast downscaling options
@@ -5238,7 +5845,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
         for (x = iStartCol, iStartCol = 0; x < cx && bContinue && iErr == 0; x++)
         {
             // Wait for input rather than decode past the end of what has arrived
-            if (bCanPause && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize &&
+            if (bCanPause && pJPEG->ucMode != 0xc2 && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize &&
                 pJPEG->iVLCSize - pJPEG->iVLCOff < JPEG_INPUT_MARGIN)
             {
                 JPEGGetMoreData(pJPEG);
@@ -5263,8 +5870,8 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
             pJPEG->ucACTable = cACTable0;
             pJPEG->ucDCTable = cDCTable0;
             // do the first luminance component
-            if (pJPEG->ucMode == 0xc2) { // progressive
-                iErr = JPEGDecodeMCU_P(pJPEG, iLum0 | iSkipMask, &iDCPred0);
+            if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
+                JPEGGetBlockP(pJPEG, iLum0 | iSkipMask, 0, x, y, 0, &iDCPred0);
             } else {
                 iErr = JPEGDecodeMCU(pJPEG, iLum0 | iSkipMask, &iDCPred0);
             }
@@ -5284,8 +5891,8 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
             // do the second luminance component
             if (pJPEG->ucSubSample > 0x11) // subsampling
             {
-                if (pJPEG->ucMode == 0xc2) { // progressive
-                    iErr |= JPEGDecodeMCU_P(pJPEG, iLum1 | iSkipMask, &iDCPred0);
+                if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
+                    JPEGGetBlockP(pJPEG, iLum1 | iSkipMask, 0, x, y, 1, &iDCPred0);
                 } else {
                     iErr |= JPEGDecodeMCU(pJPEG, iLum1 | iSkipMask, &iDCPred0);
                 }
@@ -5304,8 +5911,8 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                 }
                 if (pJPEG->ucSubSample == 0x22)
                 {
-                    if (pJPEG->ucMode == 0xc2) { // progressive
-                        iErr |= JPEGDecodeMCU_P(pJPEG, iLum2 | iSkipMask, &iDCPred0);
+                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
+                        JPEGGetBlockP(pJPEG, iLum2 | iSkipMask, 0, x, y, 2, &iDCPred0);
                     } else {
                         iErr |= JPEGDecodeMCU(pJPEG, iLum2 | iSkipMask, &iDCPred0);
                     }
@@ -5322,8 +5929,8 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     {
                         JPEGIDCT(pJPEG, iLum2, pJPEG->JPCI[0].quant_tbl_no); // first quantization table
                     }
-                    if (pJPEG->ucMode == 0xc2) { // progressive
-                        iErr |= JPEGDecodeMCU_P(pJPEG, iLum3 | iSkipMask, &iDCPred0);
+                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
+                        JPEGGetBlockP(pJPEG, iLum3 | iSkipMask, 0, x, y, 3, &iDCPred0);
                     } else {
                         iErr |= JPEGDecodeMCU(pJPEG, iLum3 | iSkipMask, &iDCPred0);
                     }
@@ -5349,16 +5956,13 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                 pJPEG->ucDCTable = cDCTable1;
                 if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
                     // We're not going to use the color channels, so avoid as much work as possible
-                    if (pJPEG->ucMode == 0xc2) { // progressive
-                        iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred1);
-                        iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred2);
-                    } else {
+                    if (pJPEG->ucMode != 0xc2) { // a progressive image has no data to pass over here
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1); // decode Cr block
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
                     }
                 } else {
-                    if (pJPEG->ucMode == 0xc2) { // progressive
-                        iErr |= JPEGDecodeMCU_P(pJPEG, iCr | iSkipMask, &iDCPred1);
+                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
+                        JPEGGetBlockP(pJPEG, iCr | iSkipMask, 1, x, y, 0, &iDCPred1);
                     } else {
                         iErr |= JPEGDecodeMCU(pJPEG, iCr | iSkipMask, &iDCPred1);
                     }
@@ -5378,8 +5982,8 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     // second chroma
                     pJPEG->ucACTable = cACTable2;
                     pJPEG->ucDCTable = cDCTable2;
-                    if (pJPEG->ucMode == 0xc2) { // progressive
-                        iErr |= JPEGDecodeMCU_P(pJPEG, iCb | iSkipMask, &iDCPred2);
+                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
+                        JPEGGetBlockP(pJPEG, iCb | iSkipMask, 2, x, y, 0, &iDCPred2);
                     } else {
                         iErr |= JPEGDecodeMCU(pJPEG, iCb | iSkipMask, &iDCPred2);
                     }
@@ -5485,7 +6089,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     iPitch = (iPitch + (mcuCX-1)) & ~(mcuCX-1);
                 }
             }
-            if (pJPEG->iResInterval)
+            if (pJPEG->iResInterval && pJPEG->ucMode != 0xc2) // a progressive image is drawn from memory
             {
                 if (--pJPEG->iResCount == 0)
                 {
@@ -5498,7 +6102,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                 } // if restart interval needs to reset
             } // if there is a restart interval
             // See if we need to feed it more data
-            if (pJPEG->iVLCOff >= FILE_HIGHWATER)
+            if (pJPEG->iVLCOff >= FILE_HIGHWATER && pJPEG->ucMode != 0xc2)
                 JPEGGetMoreData(pJPEG); // need more 'filtered' VLC data
         } // for x
         if (bPaused)
@@ -5517,6 +6121,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     {
         pJPEG->iError = JPEG_DECODE_ERROR;
         pJPEG->bDecodeActive = 0;
+        JPEGFreeP(pJPEG);
         return 0;
     }
     if (bPaused)
@@ -5524,5 +6129,6 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     if (y < cy && bContinue)
         return JPEG_DECODE_MORE;
     pJPEG->bDecodeActive = 0;
+    JPEGFreeP(pJPEG);
     return 1;
 } /* JPEGDecodeRows() */

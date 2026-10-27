@@ -79,14 +79,9 @@ int main(int argc, char **argv) {
     while ((ch = fgetc(f)) != EOF)
       file.push_back(static_cast<uint8_t>(ch));
     fclose(f);
-    jpeg.openRAM(file.data(), static_cast<int>(file.size()), draw_cb);
-    const bool progressive = jpeg.getJPEGType() == JPEG_MODE_PROGRESSIVE;
-    jpeg.close();
     for (int type : {RGB565_LITTLE_ENDIAN, RGB8888, EIGHT_BIT_GRAYSCALE}) {
       for (int k = 0; k < 4; k++) {
-        if (progressive && k != 0)
-          continue;  // a progressive image always comes out at 1/8 size
-        const int scale = progressive ? 8 : 1 << k;
+        const int scale = 1 << k;
         int fx, fy;
         decode(jpeg, file, type, options[k], scale, CROP_NONE, false, fx, fy);
         const std::vector<uint8_t> full = canvas;

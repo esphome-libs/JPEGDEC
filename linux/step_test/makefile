@@ -8,12 +8,16 @@ step_test: step_test.cpp ../../src/JPEGDEC.cpp ../../src/JPEGDEC.h ../../src/jpe
 crop_test: crop_test.cpp ../../src/JPEGDEC.cpp ../../src/JPEGDEC.h ../../src/jpeg.inl
 	$(CXX) $(CXXFLAGS) -o $@ crop_test.cpp -lm
 
-images/.done: make_images.py
-	python3 make_images.py images && touch $@
+prog_test: prog_test.cpp ../../src/JPEGDEC.cpp ../../src/JPEGDEC.h ../../src/jpeg.inl
+	$(CXX) $(CXXFLAGS) -o $@ prog_test.cpp -lm
 
-run: step_test crop_test images/.done
+images/.done: make_images.py
+	python3 make_images.py images ../../demo.jpg ../../perf.jpg && touch $@
+
+run: step_test crop_test prog_test images/.done
 	./step_test images/*.jpg ../../demo.jpg ../../perf.jpg
 	./crop_test images/*.jpg ../../demo.jpg ../../perf.jpg
+	./prog_test images/pairs.txt
 
 clean:
-	rm -rf step_test crop_test images
+	rm -rf step_test crop_test prog_test images

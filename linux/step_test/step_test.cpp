@@ -159,10 +159,6 @@ int main(int argc, char **argv) {
     while ((ch = fgetc(f)) != EOF)
       file.push_back(static_cast<uint8_t>(ch));
     fclose(f);
-    static JPEGDEC probe;
-    probe.openRAM(file.data(), static_cast<int>(file.size()), draw_cb);
-    const bool progressive = probe.getJPEGType() == JPEG_MODE_PROGRESSIVE;
-    probe.close();
     for (const Config &c : configs) {
       const Result ref = run(file, c, 0, false);
       if (ref.status != 1) {
@@ -211,8 +207,8 @@ int main(int argc, char **argv) {
         else if (got.past_delivered)
           why = "a seek past the delivered bytes";
         else if (trickle == 1 && file.size() > static_cast<size_t>(FIRST_DELIVERY) + JPEG_FILE_BUF_SIZE &&
-                 c.abort_after < 0 && !c.crop && !progressive && got.need_data_count == 0)
-          why = "no pause for data";  // a byte per row cannot keep up; a progressive image only reads its first scan
+                 c.abort_after < 0 && !c.crop && got.need_data_count == 0)
+          why = "no pause for data";  // a byte per row cannot keep up
         if (why != nullptr) {
           printf("FAIL %s %s trickle %d: %s differs (status %d/%d, calls %d/%d, pauses %d)\n", argv[a], c.name,
                  trickle, why, got.status, ref.status, got.record.calls, ref.record.calls, got.need_data_count);

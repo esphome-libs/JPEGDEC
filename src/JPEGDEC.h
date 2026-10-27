@@ -49,7 +49,8 @@
 // Copyright (c) 2020 BitBank Software, Inc.
 // 
 // Designed to decode baseline JPEG images (8 or 24-bpp)
-// using less than 22K of RAM
+// using less than 22K of RAM; progressive images also need a
+// buffer for the coefficients of the whole image
 //
 
 /* Defines and variables */
@@ -172,8 +173,8 @@ typedef struct _jpegcompinfo
 unsigned char component_needed;  /*  do we need the value of this component? */
 unsigned char component_id;     /* identifier for this component (0..255) */
 unsigned char component_index;  /* its index in SOF or cinfo->comp_info[] */
-//unsigned char h_samp_factor;    /* horizontal sampling factor (1..4) */
-//unsigned char v_samp_factor;    /* vertical sampling factor (1..4) */
+unsigned char h_samp_factor;    /* horizontal sampling factor (1..4) */
+unsigned char v_samp_factor;    /* vertical sampling factor (1..4) */
 unsigned char quant_tbl_no;     /* quantization table selector (0..3) */
 // These values may vary between scans
 // For compression, they must be supplied by the user interface
@@ -230,6 +231,19 @@ typedef struct jpeg_image_tag
     int iDMAOffset; // ping-pong buffer offset carried between decodeRows() calls
     uint16_t *pAlignedPixels; // usPixels as it was when the decode started
     int bDecodeActive; // decodeBegin() succeeded and the image is not finished
+    // A progressive image is decoded scan by scan into a buffer of DCT coefficients, then drawn from it
+    int16_t *pCoefs; // the coefficients of every block in natural order, or only the DC with JPEG_SCALE_EIGHTH
+    int iCoefStride; // coefficients kept per block
+    int iCoefOffset[MAX_COMPS_IN_SCAN]; // first block of each component in pCoefs, or -1 when it is not kept
+    int iCoefPitch[MAX_COMPS_IN_SCAN]; // blocks per row of each component in pCoefs
+    int iScanX, iScanY; // next MCU of the scan, or block when the scan has one component
+    int iScanCX, iScanCY; // size of the scan in MCUs or blocks
+    int iEOBRun; // blocks left in a run with no more AC coefficients
+    int iSkipLen; // bytes left of a marker segment being passed over between scans
+    int iRawOff, iRawSize; // input not yet filtered or parsed, in ucFileBuf after the filtered data
+    uint8_t ucScanComp; // the component of a scan with one component
+    uint8_t ucProgState; // where the decode of the scans is
+    uint8_t ucScanMarker; // the scan's data ends at the marker at iRawOff
     JPEG_READ_CALLBACK *pfnRead;
     JPEG_SEEK_CALLBACK *pfnSeek;
     JPEG_DRAW_CALLBACK *pfnDraw;

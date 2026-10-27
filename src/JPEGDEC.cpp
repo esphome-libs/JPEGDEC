@@ -231,6 +231,7 @@ int JPEGDEC::open(File &file, JPEG_DRAW_CALLBACK *pfnDraw)
 
 void JPEGDEC::close()
 {
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
     if (_jpeg.pfnClose)
         (*_jpeg.pfnClose)(_jpeg.JPEGFile.fHandle);
 } /* close() */
