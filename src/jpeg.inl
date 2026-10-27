@@ -78,7 +78,21 @@ static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable);
 static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG);
 static void JPEGFreeP(JPEGIMAGE *pJPEG);
 
-// The coefficient buffer of a progressive image is allocated with these; define them to use another allocator
+// The coefficient buffer of a progressive image is allocated with these; define them to use another allocator.
+// On ESP32 it goes in PSRAM when there is PSRAM with room for it, and in internal RAM otherwise: with
+// CONFIG_SPIRAM_USE_CAPS_ALLOC, malloc() never returns PSRAM.
+#if !defined(JPEG_MALLOC) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)) && __has_include("esp_heap_caps.h")
+#include "esp_heap_caps.h"
+#ifdef MALLOC_CAP_SPIRAM
+static void *JPEGMallocPSRAM(size_t size)
+{
+    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return (p != NULL) ? p : malloc(size);
+} /* JPEGMallocPSRAM() */
+#define JPEG_MALLOC(size) JPEGMallocPSRAM(size)
+#define JPEG_FREE(p) free(p) // frees heap_caps_malloc() memory too
+#endif // MALLOC_CAP_SPIRAM
+#endif // ESP32
 #ifndef JPEG_MALLOC
 #define JPEG_MALLOC(size) malloc(size)
 #define JPEG_FREE(p) free(p)
