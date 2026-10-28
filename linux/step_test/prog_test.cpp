@@ -8,6 +8,26 @@
 #include <cstring>
 #include <vector>
 
+// The coefficient buffer comes from these, which count the buffers held and can be made to fail
+static int g_buffers = 0;     // allocated and not yet freed
+static int g_fail_allocs = 0; // the next allocations to fail
+static void *test_malloc(size_t size) {
+  if (g_fail_allocs > 0) {
+    g_fail_allocs--;
+    return nullptr;
+  }
+  void *p = malloc(size);
+  if (p != nullptr)
+    g_buffers++;
+  return p;
+}
+static void test_free(void *p) {
+  g_buffers--;
+  free(p);
+}
+#define JPEG_MALLOC(size) test_malloc(size)
+#define JPEG_FREE(p) test_free(p)
+
 #include "../../src/JPEGDEC.h"
 #include "../../src/JPEGDEC.cpp"
 
@@ -123,6 +143,111 @@ static std::vector<uint8_t> load(const char *name) {
   return file;
 }
 
+// Decode an image that is open with decodeBegin() and decodeRows()
+static int decode_open(JPEGDEC &jpeg, int options, Record *rec) {
+  jpeg.setUserPointer(rec);
+  if (!jpeg.decodeBegin(0, 0, options))
+    return 0;
+  int status;
+  while ((status = jpeg.decodeRows(1000)) == JPEG_DECODE_MORE) {
+  }
+  return status;
+}
+
+// Running out of memory, decoding after close(), opening another image part way through and bad frame sizes
+static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *checks) {
+  static JPEGDEC jpeg;
+  int failures = 0;
+  const int32_t size = static_cast<int32_t>(prog.size());
+  MemFile mem{&prog, size};
+  auto open = [&]() { return jpeg.open(&mem, size, close_cb, read_cb, seek_cb, draw_cb); };
+  auto fail = [&](const char *what, int options) {
+    printf("FAIL %s options %d: %s\n", name, options, what);
+    failures++;
+  };
+  for (int options : {0, JPEG_SCALE_HALF, JPEG_SCALE_QUARTER}) {
+    Record ref;
+    open();
+    const int ref_status = decode_open(jpeg, options, &ref);
+    jpeg.close();
+    // A decodeBegin() that had not the memory for even the DC can be retried
+    (*checks)++;
+    Record got;
+    open();
+    g_fail_allocs = 2;
+    if (jpeg.decodeBegin(0, 0, options) || jpeg.getLastError() != JPEG_ERROR_MEMORY)
+      fail("no JPEG_ERROR_MEMORY", options);
+    g_fail_allocs = 0;
+    if (decode_open(jpeg, options, &got) != ref_status || got.geometry != ref.geometry || got.pixels != ref.pixels)
+      fail("retry after JPEG_ERROR_MEMORY differs", options);
+    jpeg.close();
+    // Without the memory for every coefficient, only the DC: blocks of one color, in the same places
+    (*checks)++;
+    Record dc;
+    open();
+    g_fail_allocs = 1;
+    if (decode_open(jpeg, options, &dc) != 1 || dc.geometry != ref.geometry)
+      fail("DC only, short of memory, differs", options);
+    g_fail_allocs = 0;
+    jpeg.close();
+  }
+  // Opening another image frees the buffer of one that was not finished
+  (*checks)++;
+  Record rec;
+  open();
+  jpeg.setUserPointer(&rec);
+  jpeg.decodeBegin(0, 0, 0);
+  jpeg.decodeRows(1);
+  if (g_buffers != 1)
+    fail("no buffer part way through", 0);
+  open();
+  if (g_buffers != 0)
+    fail("open() kept the buffer", 0);
+  jpeg.close();
+  // decodeRows() after close() is refused
+  (*checks)++;
+  open();
+  jpeg.setUserPointer(&rec);
+  jpeg.decodeBegin(0, 0, 0);
+  jpeg.close();
+  if (jpeg.decodeRows(1) != 0 || jpeg.getLastError() != JPEG_INVALID_PARAMETER)
+    fail("decodeRows() after close() not refused", 0);
+  // Color output after a decodeBegin() for grayscale, which keeps no chroma
+  (*checks)++;
+  open();
+  jpeg.setUserPointer(&rec);
+  jpeg.setPixelType(EIGHT_BIT_GRAYSCALE);
+  jpeg.decodeBegin(0, 0, 0);
+  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  int status;
+  while ((status = jpeg.decodeRows(1000)) == JPEG_DECODE_MORE) {
+  }
+  if (status != 1)
+    fail("color after grayscale decodeBegin()", 0);
+  jpeg.close();
+  // A width or height of 0 is refused
+  for (int field : {5, 7}) {
+    (*checks)++;
+    std::vector<uint8_t> zero = prog;
+    for (size_t i = 0; i + 9 < zero.size(); i++) {
+      if (zero[i] == 0xff && zero[i + 1] == 0xc2) {
+        zero[i + field] = zero[i + field + 1] = 0;
+        break;
+      }
+    }
+    MemFile zero_mem{&zero, size};
+    if (jpeg.open(&zero_mem, size, close_cb, read_cb, seek_cb, draw_cb)) {
+      jpeg.setUserPointer(&rec);
+      if (jpeg.decode(0, 0, 0) != 0)
+        fail(field == 5 ? "height 0 decoded" : "width 0 decoded", 0);
+      jpeg.close();
+    }
+  }
+  if (g_buffers != 0)
+    fail("buffers left", 0);
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -148,6 +273,7 @@ int main(int argc, char **argv) {
       {"crop", RGB565_LITTLE_ENDIAN, 0, true, false},
       {"framebuffer", RGB565_LITTLE_ENDIAN, 0, false, true},
       {"crop_quarter_framebuffer", RGB8888, JPEG_SCALE_QUARTER, true, true},
+      {"quarter_eighth", RGB565_LITTLE_ENDIAN, JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH, false, false},
   };
   if (argc != 2) {
     printf("usage: %s pairs.txt\n", argv[0]);
@@ -195,6 +321,7 @@ int main(int argc, char **argv) {
         }
       }
     }
+    failures += edge_checks(prog, prog_name, &checks);
     // Cut short: the whole image is still drawn, from what arrived
     const Config &c = configs[0];
     const Result ref = run(base, c, 0, 0);

@@ -81,7 +81,8 @@ static void JPEGFreeP(JPEGIMAGE *pJPEG);
 // The coefficient buffer of a progressive image is allocated with these; define them to use another allocator.
 // On ESP32 it goes in PSRAM when there is PSRAM with room for it, and in internal RAM otherwise: with
 // CONFIG_SPIRAM_USE_CAPS_ALLOC, malloc() never returns PSRAM.
-#if !defined(JPEG_MALLOC) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)) && __has_include("esp_heap_caps.h")
+#if !defined(JPEG_MALLOC) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)) && defined(__has_include)
+#if __has_include("esp_heap_caps.h") // in its own #if: a compiler without __has_include cannot parse it
 #include "esp_heap_caps.h"
 #ifdef MALLOC_CAP_SPIRAM
 static void *JPEGMallocPSRAM(size_t size)
@@ -90,12 +91,14 @@ static void *JPEGMallocPSRAM(size_t size)
     return (p != NULL) ? p : malloc(size);
 } /* JPEGMallocPSRAM() */
 #define JPEG_MALLOC(size) JPEGMallocPSRAM(size)
-#define JPEG_FREE(p) free(p) // frees heap_caps_malloc() memory too
 #endif // MALLOC_CAP_SPIRAM
+#endif // __has_include("esp_heap_caps.h")
 #endif // ESP32
 #ifndef JPEG_MALLOC
 #define JPEG_MALLOC(size) malloc(size)
-#define JPEG_FREE(p) free(p)
+#endif
+#ifndef JPEG_FREE
+#define JPEG_FREE(p) free(p) // frees heap_caps_malloc() memory too
 #endif
 
 // Where the decode of a progressive image is
@@ -715,6 +718,7 @@ int JPEG_decodeDither(JPEGIMAGE *pJPEG, uint8_t *pDither, int iOptions)
 
 void JPEG_close(JPEGIMAGE *pJPEG)
 {
+    pJPEG->bDecodeActive = 0;
     JPEGFreeP(pJPEG);
     if (pJPEG->pfnClose)
         (*pJPEG->pfnClose)(pJPEG->JPEGFile.fHandle);
@@ -2028,6 +2032,37 @@ static int16_t *JPEGBlockP(JPEGIMAGE *pJPEG, int iComp, int bx, int by)
     return &pJPEG->pCoefs[((size_t)pJPEG->iCoefOffset[iComp] + (size_t)by * pJPEG->iCoefPitch[iComp] + bx) * pJPEG->iCoefStride];
 } /* JPEGBlockP() */
 
+//
+// Set coefficient k (in zigzag order) of a block to a nonzero value. Past the coefficients that are kept, only
+// that it is nonzero is kept, which a refinement scan needs to know.
+//
+static inline void JPEGSetCoefP(int16_t *pCoef, int iKeep, int k, int iValue)
+{
+    if (k < iKeep)
+        pCoef[k] = (int16_t)iValue;
+    else
+        ((uint16_t *)&pCoef[iKeep])[k >> 4] |= (uint16_t)(1 << (k & 15));
+} /* JPEGSetCoefP() */
+//
+// When coefficient k (in zigzag order) of a block is nonzero, read its correction bit and add it.
+// Returns whether it is nonzero.
+//
+static inline int JPEGRefineCoefP(BUFFERED_BITS *pBB, int16_t *pCoef, int iKeep, int k, int p1)
+{
+    if (k >= iKeep) // not kept: only its bit is passed over
+    {
+        if ((((uint16_t *)&pCoef[iKeep])[k >> 4] & (1 << (k & 15))) == 0)
+            return 0;
+        JPEGGetBitsP(pBB, 1);
+        return 1;
+    }
+    if (pCoef[k] == 0)
+        return 0;
+    if (JPEGGetBitsP(pBB, 1) && (pCoef[k] & p1) == 0)
+        pCoef[k] += (pCoef[k] >= 0) ? p1 : -p1;
+    return 1;
+} /* JPEGRefineCoefP() */
+
 static int *JPEGDCPredP(JPEGIMAGE *pJPEG, int iComp)
 {
     return (iComp == 0) ? &pJPEG->iDCPred0 : (iComp == 1) ? &pJPEG->iDCPred1 : &pJPEG->iDCPred2;
@@ -2040,7 +2075,7 @@ static int *JPEGDCPredP(JPEGIMAGE *pJPEG, int iComp)
 static int JPEGDecodeBlockP(JPEGIMAGE *pJPEG, int16_t *pCoef, int *piDCPred, const uint16_t *pDCTable, const uint16_t *pACTable)
 {
     BUFFERED_BITS bb = pJPEG->bb; // a local copy that the compiler can keep in registers
-    int k, n, r, s, iEnd = pJPEG->iScanEnd;
+    int k, r, s, iEnd = pJPEG->iScanEnd, iKeep = pJPEG->iCoefKeep;
     int p1 = 1 << pJPEG->cApproxBitsLow, m1 = -p1; // the bit of the coefficients that this scan adds
 
     if (pJPEG->iScanStart == 0) // DC
@@ -2080,7 +2115,7 @@ static int JPEGDecodeBlockP(JPEGIMAGE *pJPEG, int16_t *pCoef, int *piDCPred, con
                     k += r;
                     if (k > 63)
                         goto bad_data;
-                    pCoef[cZigZag2[k]] = (int16_t)(JPEGExtendP(JPEGGetBitsP(&bb, s), s) * p1);
+                    JPEGSetCoefP(pCoef, iKeep, k, JPEGExtendP(JPEGGetBitsP(&bb, s), s) * p1);
                 }
                 else if (r == 15) // sixteen zeros
                 {
@@ -2124,33 +2159,21 @@ static int JPEGDecodeBlockP(JPEGIMAGE *pJPEG, int16_t *pCoef, int *piDCPred, con
                 // Pass over r coefficients that are still zero, refining the nonzero ones on the way
                 for (; k <= iEnd; k++)
                 {
-                    n = cZigZag2[k];
-                    if (pCoef[n])
-                    {
-                        if (JPEGGetBitsP(&bb, 1) && (pCoef[n] & p1) == 0)
-                            pCoef[n] += (pCoef[n] >= 0) ? p1 : m1;
-                    }
-                    else if (--r < 0)
-                    {
+                    if (!JPEGRefineCoefP(&bb, pCoef, iKeep, k, p1) && --r < 0)
                         break;
-                    }
                 }
                 if (s)
                 {
                     if (k > 63)
                         goto bad_data;
-                    pCoef[cZigZag2[k]] = (int16_t)s;
+                    JPEGSetCoefP(pCoef, iKeep, k, s);
                 }
             }
         }
         if (pJPEG->iEOBRun) // in a run of blocks with no new coefficients: refine the nonzero ones
         {
             for (; k <= iEnd; k++)
-            {
-                n = cZigZag2[k];
-                if (pCoef[n] && JPEGGetBitsP(&bb, 1) && (pCoef[n] & p1) == 0)
-                    pCoef[n] += (pCoef[n] >= 0) ? p1 : m1;
-            }
+                JPEGRefineCoefP(&bb, pCoef, iKeep, k, p1);
             pJPEG->iEOBRun--;
         }
     }
@@ -2331,7 +2354,7 @@ static int JPEGStartScanP(JPEGIMAGE *pJPEG)
     pJPEG->iDCPred0 = pJPEG->iDCPred1 = pJPEG->iDCPred2 = 0;
     pJPEG->iResCount = pJPEG->iResInterval;
     // Pass over a scan of a component that is not kept, and AC scans when only the DC is kept
-    if ((iCount == 1 && pJPEG->iCoefOffset[iComp] < 0) || (pJPEG->iScanStart && pJPEG->iCoefStride == 1))
+    if ((iCount == 1 && pJPEG->iCoefOffset[iComp] < 0) || (pJPEG->iScanStart && pJPEG->iCoefKeep == 1))
         pJPEG->ucProgState = JPEG_PROG_SKIP;
     else
         pJPEG->ucProgState = JPEG_PROG_SCAN;
@@ -2534,7 +2557,7 @@ static int JPEGDecodeScanRowP(JPEGIMAGE *pJPEG, int bCanPause)
         }
     }
     pJPEG->iScanX = 0;
-    if (++pJPEG->iScanY == pJPEG->iScanCY)
+    if (++pJPEG->iScanY >= pJPEG->iScanCY)
         JPEGEndScanP(pJPEG);
     return 1;
 } /* JPEGDecodeScanRowP() */
@@ -2598,13 +2621,33 @@ static int JPEGDecodeScansP(JPEGIMAGE *pJPEG, int *piRows, int bCanPause)
     return 1;
 } /* JPEGDecodeScansP() */
 //
+// Allocate the coefficient buffer, keeping the first iKeep coefficients of each block in zigzag order, and when
+// that is not all of them and not only the DC, a nonzero flag for each of the rest
+// Returns 1 for success, 0 when there is not the memory
+//
+static int JPEGAllocCoefsP(JPEGIMAGE *pJPEG, int iBlocks, int iKeep)
+{
+    int iStride = iKeep + ((iKeep > 1 && iKeep < DCTSIZE) ? DCTSIZE / 16 : 0);
+    size_t iSize;
+
+    if ((size_t)iBlocks > ((size_t)-1) / (iStride * sizeof(int16_t)))
+        return 0;
+    iSize = (size_t)iBlocks * iStride * sizeof(int16_t);
+    pJPEG->pCoefs = (int16_t *)JPEG_MALLOC(iSize);
+    if (pJPEG->pCoefs == NULL)
+        return 0;
+    memset(pJPEG->pCoefs, 0, iSize);
+    pJPEG->iCoefKeep = iKeep;
+    pJPEG->iCoefStride = iStride;
+    return 1;
+} /* JPEGAllocCoefsP() */
+//
 // Allocate the coefficient buffer of a progressive image and start its first scan, whose header was read when
 // the image was opened. Returns 1 for success, 0 for failure.
 //
 static int JPEGStartP(JPEGIMAGE *pJPEG)
 {
-    int i, cx, cy, iBlocks = 0;
-    size_t iSize;
+    int i, cx, cy, iKeep, iBlocks = 0;
     JPEGCOMPINFO *pComp = pJPEG->JPCI;
 
     // Grayscale, or color with 1 to 2x2 luma blocks to each chroma block, as JPEGDecodeRows() draws
@@ -2622,9 +2665,13 @@ static int JPEGStartP(JPEGIMAGE *pJPEG)
         pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
         return 0;
     }
+    if (pJPEG->iWidth < 1 || pJPEG->iHeight < 1) // a height of 0 comes later in a DNL marker
+    {
+        pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+        return 0;
+    }
     cx = (pJPEG->iWidth + pComp[0].h_samp_factor*8 - 1) / (pComp[0].h_samp_factor*8); // MCUs
     cy = (pJPEG->iHeight + pComp[0].v_samp_factor*8 - 1) / (pComp[0].v_samp_factor*8);
-    pJPEG->iCoefStride = (pJPEG->iOptions & JPEG_SCALE_EIGHTH) ? 1 : DCTSIZE; // 1/8 scale only draws the DC
     for (i = 0; i < MAX_COMPS_IN_SCAN; i++)
     {
         pJPEG->iCoefOffset[i] = -1;
@@ -2635,19 +2682,21 @@ static int JPEGStartP(JPEGIMAGE *pJPEG)
         pJPEG->iCoefPitch[i] = cx * pComp[i].h_samp_factor;
         iBlocks += cx * pComp[i].h_samp_factor * cy * pComp[i].v_samp_factor;
     }
-    if ((size_t)iBlocks > ((size_t)-1) / (pJPEG->iCoefStride * sizeof(int16_t)))
+    // The coefficients that the IDCT reads at the scale drawn, which JPEGDecodeRows() picks in this order
+    if (pJPEG->iOptions & JPEG_SCALE_HALF)
+        iKeep = DCTSIZE;
+    else if (pJPEG->iOptions & JPEG_SCALE_QUARTER)
+        iKeep = 5;
+    else if (pJPEG->iOptions & JPEG_SCALE_EIGHTH)
+        iKeep = 1;
+    else
+        iKeep = DCTSIZE;
+    // Without the memory for them, only the DC, which draws each block in one color at the same scale
+    if (!JPEGAllocCoefsP(pJPEG, iBlocks, iKeep) && (iKeep == 1 || !JPEGAllocCoefsP(pJPEG, iBlocks, 1)))
     {
         pJPEG->iError = JPEG_ERROR_MEMORY;
         return 0;
     }
-    iSize = (size_t)iBlocks * pJPEG->iCoefStride * sizeof(int16_t);
-    pJPEG->pCoefs = (int16_t *)JPEG_MALLOC(iSize);
-    if (pJPEG->pCoefs == NULL)
-    {
-        pJPEG->iError = JPEG_ERROR_MEMORY;
-        return 0;
-    }
-    memset(pJPEG->pCoefs, 0, iSize);
     if (!JPEGStartScanP(pJPEG))
     {
         JPEGFreeP(pJPEG);
@@ -2673,32 +2722,31 @@ static void JPEGGetBlockP(JPEGIMAGE *pJPEG, int iMCU, int iComp, int x, int y, i
     JPEGCOMPINFO *pComp = &pJPEG->JPCI[iComp];
     int16_t *pCoef, *pMCU;
     uint16_t u16MCUFlags = 0;
-    int i, n, iEnd;
+    int i, n;
 
     pCoef = JPEGBlockP(pJPEG, iComp, x * pComp->h_samp_factor + (iBlock % pComp->h_samp_factor),
                        y * pComp->v_samp_factor + (iBlock / pComp->h_samp_factor));
     pJPEG->u16MCUFlags = 0;
+    if (pCoef == NULL) // not kept, as when the pixel type changed after decodeBegin(): drawn as a flat 0 DC
+    {
+        *iDCPredictor = 0;
+        return;
+    }
     *iDCPredictor = pCoef[0];
-    if (iMCU < 0 || pJPEG->iCoefStride == 1) // skipped, or only the DC is drawn
+    if (iMCU < 0 || pJPEG->iCoefKeep == 1) // skipped, or only the DC is drawn
         return;
     pMCU = &pJPEG->sMCUs[iMCU];
-    if (pJPEG->iOptions & JPEG_SCALE_QUARTER) // only the first few coefficients are used
-    {
-        pMCU[0] = pCoef[0];
+    if (pJPEG->iCoefKeep == DCTSIZE)
+        memset(pMCU, 0, DCTSIZE * sizeof(int16_t));
+    else // reduced size DCT: the rest of the block is left as it was
         pMCU[1] = pMCU[8] = pMCU[9] = 0;
-        iEnd = 5;
-    }
-    else
-    {
-        memcpy(pMCU, pCoef, DCTSIZE * sizeof(int16_t));
-        iEnd = DCTSIZE;
-    }
-    for (i = 1; i < iEnd; i++) // mark the columns and rows with coefficients for the IDCT
+    pMCU[0] = pCoef[0];
+    for (i = 1; i < pJPEG->iCoefKeep; i++) // into natural order, marking the columns and rows with coefficients for the IDCT
     {
         n = cZigZag2[i];
-        if (pCoef[n])
+        if (pCoef[i])
         {
-            pMCU[n] = pCoef[n];
+            pMCU[n] = pCoef[i];
             u16MCUFlags |= 1<<(n & 7);
             u16MCUFlags |= n << 8;
         }
@@ -5627,11 +5675,14 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
         if (!JPEGParseInfo(pJPEG, 1)) // parse the embedded thumbnail file header
             return 0; // something went wrong
     }
+    // One scale, in the order JPEGDecodeRows() picks it: the IDCT and the color conversion check them in other orders
+    if (pJPEG->iOptions & JPEG_SCALE_HALF)
+        pJPEG->iOptions &= ~(JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH);
+    else if (pJPEG->iOptions & JPEG_SCALE_QUARTER)
+        pJPEG->iOptions &= ~JPEG_SCALE_EIGHTH;
     if (pJPEG->iOptions & JPEG_LUMA_ONLY && pJPEG->ucPixelType < EIGHT_BIT_GRAYSCALE) {
         pJPEG->ucPixelType = EIGHT_BIT_GRAYSCALE; // switch to grayscale output
     }
-    // reorder and fix the quantization table for decoding
-    JPEGFixQuantD(pJPEG);
     pJPEG->bb.ulBits = MOTOLONG(&pJPEG->ucFileBuf[0]); // preload first 4/8 bytes
     pJPEG->bb.pBuf = pJPEG->ucFileBuf;
     pJPEG->bb.ulBitOff = 0;
@@ -5644,6 +5695,8 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
     pJPEG->pAlignedPixels = pJPEG->usPixels;
     if (pJPEG->ucMode == 0xc2 && !JPEGStartP(pJPEG)) // progressive: the scans are decoded before drawing
         return 0;
+    // reorder and fix the quantization table for decoding; last, so that a decodeBegin() that failed can be retried
+    JPEGFixQuantD(pJPEG);
     pJPEG->bDecodeActive = 1;
     return 1;
 } /* JPEGDecodeStart() */
