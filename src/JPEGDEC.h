@@ -231,8 +231,10 @@ typedef struct jpeg_image_tag
     int iDMAOffset; // ping-pong buffer offset carried between decodeRows() calls
     uint16_t *pAlignedPixels; // usPixels as it was when the decode started
     int bDecodeActive; // decodeBegin() succeeded and the image is not finished
+    int bDecoded; // decodeBegin() succeeded since the image was opened, which uses up its input and tables
     // A progressive image is decoded scan by scan into a buffer of DCT coefficients, then drawn from it
     int16_t *pCoefs; // the first iCoefKeep coefficients of every block in zigzag order, then flags of the rest
+    uintptr_t uCoefsCheck; // JPEG_COEFS_CHECK(pCoefs), which tells a buffer from what is left in memory not cleared
     int iCoefKeep; // coefficients kept per block: 64, 5 at 1/4 scale, or only the DC at 1/8 scale or short of memory
     int iCoefStride; // int16_t per block: iCoefKeep, and 4 more for the nonzero flags of the rest when there are any
     int iCoefOffset[MAX_COMPS_IN_SCAN]; // first block of each component in pCoefs, or -1 when it is not kept
@@ -279,6 +281,9 @@ class JPEGDEC
   public:
     JPEGDEC();
     ~JPEGDEC();
+    // A copy would free the coefficient buffer of a progressive image a second time
+    JPEGDEC(const JPEGDEC &) = delete;
+    JPEGDEC &operator=(const JPEGDEC &) = delete;
     int openRAM(uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw);
     int openFLASH(const uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw);
     int open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOSE_CALLBACK *pfnClose, JPEG_READ_CALLBACK *pfnRead, JPEG_SEEK_CALLBACK *pfnSeek, JPEG_DRAW_CALLBACK *pfnDraw);

@@ -75,20 +75,27 @@ static void closeFile(void *handle);
 #endif
 static void JPEGDither(JPEGIMAGE *pJPEG, int iWidth, int iHeight);
 static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable);
-static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG);
+static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG, int iTables);
 static void JPEGFreeP(JPEGIMAGE *pJPEG);
 
 // The coefficient buffer of a progressive image is allocated with these; define them to use another allocator.
-// On ESP32 it goes in PSRAM when there is PSRAM with room for it, and in internal RAM otherwise: with
-// CONFIG_SPIRAM_USE_CAPS_ALLOC, malloc() never returns PSRAM.
+// On ESP32 it goes in PSRAM when there is PSRAM with room for it, and in internal RAM otherwise, but only while
+// that leaves JPEG_INTERNAL_RESERVE bytes of it for the system (WiFi, the network stack, tasks). A buffer that
+// does not fit is tried again with only the DC, 1/64 of the size. With CONFIG_SPIRAM_USE_CAPS_ALLOC, malloc()
+// never returns PSRAM.
 #if !defined(JPEG_MALLOC) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)) && defined(__has_include)
 #if __has_include("esp_heap_caps.h") // in its own #if: a compiler without __has_include cannot parse it
 #include "esp_heap_caps.h"
 #ifdef MALLOC_CAP_SPIRAM
+#ifndef JPEG_INTERNAL_RESERVE
+#define JPEG_INTERNAL_RESERVE 49152
+#endif
 static void *JPEGMallocPSRAM(size_t size)
 {
     void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return (p != NULL) ? p : malloc(size);
+    if (p == NULL && heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= size + JPEG_INTERNAL_RESERVE)
+        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p;
 } /* JPEGMallocPSRAM() */
 #define JPEG_MALLOC(size) JPEGMallocPSRAM(size)
 #endif // MALLOC_CAP_SPIRAM
@@ -100,6 +107,10 @@ static void *JPEGMallocPSRAM(size_t size)
 #ifndef JPEG_FREE
 #define JPEG_FREE(p) free(p) // frees heap_caps_malloc() memory too
 #endif
+// Opening an image frees the buffer of one that was not finished, but the JPEGIMAGE may never have been cleared:
+// a JPEGIMAGE on the stack, or a JPEGDEC from malloc(), whose constructor did not run. pCoefs is only freed when
+// uCoefsCheck agrees with it, which what is left in memory does not by chance.
+#define JPEG_COEFS_CHECK(p) ((uintptr_t)(p) ^ (uintptr_t)0x4a504547)
 
 // Where the decode of a progressive image is
 enum {
@@ -599,6 +610,7 @@ static const uint16_t usRangeTableB[] = {0x0000,0x0000,0x0000,0x0000,0x0000,0x00
 //
 int JPEG_openRAM(JPEGIMAGE *pJPEG, uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(pJPEG); // the coefficients of a progressive image that was not finished
     memset(pJPEG, 0, sizeof(JPEGIMAGE));
     pJPEG->ucMemType = JPEG_MEM_RAM;
     pJPEG->pfnRead = readRAM;
@@ -616,6 +628,7 @@ int JPEG_openRAM(JPEGIMAGE *pJPEG, uint8_t *pData, int iDataSize, JPEG_DRAW_CALL
 //
 int JPEG_openFile(JPEGIMAGE *pJPEG, const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(pJPEG); // the coefficients of a progressive image that was not finished
     memset(pJPEG, 0, sizeof(JPEGIMAGE));
     pJPEG->ucMemType = JPEG_MEM_RAM;
     pJPEG->pfnRead = readFile;
@@ -1131,7 +1144,7 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     int iTablesUsed;
     
     if (pJPEG->ucMode == 0xc2) // progressive images have their own tables
-        return JPEGMakeHuffTablesP(pJPEG);
+        return JPEGMakeHuffTablesP(pJPEG, pJPEG->ucHuffTableUsed);
     iTablesUsed = 0;
     pHuffVals = (uint8_t *)pJPEG->usPixels;
     for (j=0; j<4; j++)
@@ -1928,7 +1941,10 @@ static void JPEGFixQuantD(JPEGIMAGE *pJPEG)
 #define HUFFP_VALUES (HUFFP_VALOFF + 17)
 #define HUFFP_SIZE 1024 // HUFFP_VALUES + 256 values, and 4 tables fill usHuffAC
 
-static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG)
+//
+// Make the tables whose bits are set in iTables, as in ucHuffTableUsed
+//
+static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG, int iTables)
 {
     int iTable, iLen, iCount, iCode, iValue, i;
     uint8_t *pBits;
@@ -1937,7 +1953,7 @@ static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG)
     for (iTable = 0; iTable < 8; iTable++) // DC tables 0-3, then AC tables 0-3
     {
         // Only tables 0 and 1 have room; a scan that uses another is refused
-        if (!(pJPEG->ucHuffTableUsed & (1 << iTable)) || (iTable & 3) > 1)
+        if (!(iTables & (1 << iTable)) || (iTable & 3) > 1)
             continue;
         pTable = &pJPEG->usHuffAC[((iTable >> 2) * 2 + (iTable & 3)) * HUFFP_SIZE];
         pBits = &((uint8_t *)pJPEG->usPixels)[iTable * HUFF_TABLEN]; // as JPEGGetHuffTables() left it
@@ -2250,13 +2266,42 @@ static int JPEGFilterP(uint8_t *s, uint8_t *d, int iLen, int *piUsed, uint8_t *p
     return (int)(d - pOut);
 } /* JPEGFilterP() */
 //
+// The filtered data of a scan ends this far before the end of ucFileBuf. The bit reader loads 8 bytes at a time,
+// and a block of bad data can take it past the end of the data before that is noticed: a block reads at most 63
+// codes of 16 bits with 15 more bits each, under 250 bytes.
+//
+#define JPEGP_VLC_SIZE (JPEG_FILE_BUF_SIZE - 320)
+//
+// Read more input after what ucFileBuf holds; returns the number of bytes read
+//
+static int JPEGReadInputP(JPEGIMAGE *pJPEG)
+{
+    int iRead = 0;
+
+    if (pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize && pJPEG->iRawSize < JPEG_FILE_BUF_SIZE)
+    {
+        iRead = (*pJPEG->pfnRead)(&pJPEG->JPEGFile, &pJPEG->ucFileBuf[pJPEG->iRawSize], JPEG_FILE_BUF_SIZE - pJPEG->iRawSize);
+        if (iRead < 0)
+            iRead = 0;
+        pJPEG->iRawSize += iRead;
+    }
+    return iRead;
+} /* JPEGReadInputP() */
+//
+// More of the scan's data is to come: input that is held but did not fit in the filtered data, or still to be read
+//
+static int JPEGMoreDataP(JPEGIMAGE *pJPEG)
+{
+    return !pJPEG->ucScanMarker && (pJPEG->iRawSize > JPEGP_VLC_SIZE || pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize);
+} /* JPEGMoreDataP() */
+//
 // Read and filter more of a scan's data. The data not yet decoded and the input after it move to the start of
 // the buffer first, and the bit reader with them. Returns the number of bytes read.
 //
 static int JPEGGetMoreDataP(JPEGIMAGE *pJPEG)
 {
     uint8_t *pBuf = pJPEG->ucFileBuf;
-    int iOff, iLen, iRawLen, iRead = 0, iUsed;
+    int iOff, iLen, iRawLen, iRawEnd, iRead = 0, iUsed;
 
     pJPEG->bb.pBuf += (pJPEG->bb.ulBitOff >> 3); // a whole byte, which can move
     pJPEG->bb.ulBitOff &= 7;
@@ -2273,16 +2318,11 @@ static int JPEGGetMoreDataP(JPEGIMAGE *pJPEG)
     pJPEG->iRawSize = iLen + iRawLen;
     if (!pJPEG->ucScanMarker) // the scan's data goes on
     {
-        if (pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize && pJPEG->iRawSize < JPEG_FILE_BUF_SIZE)
-        {
-            iRead = (*pJPEG->pfnRead)(&pJPEG->JPEGFile, &pBuf[pJPEG->iRawSize], JPEG_FILE_BUF_SIZE - pJPEG->iRawSize);
-            if (iRead < 0)
-                iRead = 0;
-            pJPEG->iRawSize += iRead;
-        }
-        pJPEG->iVLCSize += JPEGFilterP(&pBuf[pJPEG->iRawOff], &pBuf[pJPEG->iVLCSize], pJPEG->iRawSize - pJPEG->iRawOff, &iUsed, &pJPEG->ucScanMarker);
+        iRead = JPEGReadInputP(pJPEG);
+        iRawEnd = (pJPEG->iRawSize < JPEGP_VLC_SIZE) ? pJPEG->iRawSize : JPEGP_VLC_SIZE; // filtered data is no longer
+        pJPEG->iVLCSize += JPEGFilterP(&pBuf[pJPEG->iRawOff], &pBuf[pJPEG->iVLCSize], iRawEnd - pJPEG->iRawOff, &iUsed, &pJPEG->ucScanMarker);
         pJPEG->iRawOff += iUsed;
-        if (!pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos >= pJPEG->JPEGFile.iSize) // the file ends before the scan
+        if (!JPEGMoreDataP(pJPEG) && !pJPEG->ucScanMarker) // the file ends before the scan
             memset(&pBuf[pJPEG->iVLCSize], 0, JPEG_FILE_BUF_SIZE - pJPEG->iVLCSize); // its last block reads zeros
     }
     pJPEG->bb.ulBits = MOTOLONG(pBuf);
@@ -2378,19 +2418,12 @@ static void JPEGEndScanP(JPEGIMAGE *pJPEG)
 //
 static int JPEGReadRawP(JPEGIMAGE *pJPEG)
 {
-    int iLen = pJPEG->iRawSize - pJPEG->iRawOff, iRead = 0;
+    int iLen = pJPEG->iRawSize - pJPEG->iRawOff;
 
     memmove(pJPEG->ucFileBuf, &pJPEG->ucFileBuf[pJPEG->iRawOff], iLen);
     pJPEG->iRawOff = 0;
     pJPEG->iRawSize = iLen;
-    if (pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize && iLen < JPEG_FILE_BUF_SIZE)
-    {
-        iRead = (*pJPEG->pfnRead)(&pJPEG->JPEGFile, &pJPEG->ucFileBuf[iLen], JPEG_FILE_BUF_SIZE - iLen);
-        if (iRead < 0)
-            iRead = 0;
-        pJPEG->iRawSize += iRead;
-    }
-    return iRead;
+    return JPEGReadInputP(pJPEG);
 } /* JPEGReadRawP() */
 //
 // Read the markers after a scan, up to the next scan or the end of the image
@@ -2398,8 +2431,8 @@ static int JPEGReadRawP(JPEGIMAGE *pJPEG)
 //
 static int JPEGReadMarkersP(JPEGIMAGE *pJPEG, int bCanPause)
 {
-    uint8_t *s, ucMarker;
-    int iAvail, iLen, iOff;
+    uint8_t *s, ucMarker, ucUsed;
+    int iAvail, iLen, iOff, iTables, iErr;
 
     for (;;)
     {
@@ -2454,8 +2487,13 @@ static int JPEGReadMarkersP(JPEGIMAGE *pJPEG, int bCanPause)
                 {
                     switch (ucMarker)
                     {
-                        case 0xc4: // Huffman tables
-                            if (JPEGGetHuffTables(&s[4], iLen - 4, pJPEG) != 0 || !JPEGMakeHuffTablesP(pJPEG))
+                        case 0xc4: // Huffman tables: only the ones it defines are made again
+                            ucUsed = pJPEG->ucHuffTableUsed;
+                            pJPEG->ucHuffTableUsed = 0;
+                            iErr = JPEGGetHuffTables(&s[4], iLen - 4, pJPEG);
+                            iTables = pJPEG->ucHuffTableUsed;
+                            pJPEG->ucHuffTableUsed |= ucUsed;
+                            if (iErr != 0 || !JPEGMakeHuffTablesP(pJPEG, iTables))
                             {
                                 pJPEG->iError = JPEG_DECODE_ERROR;
                                 return 0;
@@ -2517,12 +2555,12 @@ static int JPEGDecodeScanRowP(JPEGIMAGE *pJPEG, int bCanPause)
     {
         // Wait for input rather than decode past the end of what has arrived, as JPEGDecodeRows() does
         iAvail = JPEGBytesLeftP(pJPEG);
-        bMore = !pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize; // more of the data to read
+        bMore = JPEGMoreDataP(pJPEG);
         if (bMore && iAvail < JPEG_INPUT_MARGIN)
         {
             JPEGGetMoreDataP(pJPEG);
             iAvail = JPEGBytesLeftP(pJPEG);
-            bMore = !pJPEG->ucScanMarker && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize;
+            bMore = JPEGMoreDataP(pJPEG);
             if (bMore && bCanPause && iAvail < JPEG_INPUT_MARGIN)
             {
                 pJPEG->iScanX = x;
@@ -2571,7 +2609,7 @@ static int JPEGSkipScanP(JPEGIMAGE *pJPEG, int bCanPause)
 
     pJPEG->bb.pBuf = &pJPEG->ucFileBuf[pJPEG->iVLCSize]; // drop the data filtered so far
     pJPEG->bb.ulBitOff = 0;
-    if (pJPEG->ucScanMarker || pJPEG->JPEGFile.iPos >= pJPEG->JPEGFile.iSize) // read up to its end
+    if (!JPEGMoreDataP(pJPEG)) // read up to its end
     {
         JPEGEndScanP(pJPEG);
         return 1;
@@ -2637,6 +2675,7 @@ static int JPEGAllocCoefsP(JPEGIMAGE *pJPEG, int iBlocks, int iKeep)
     if (pJPEG->pCoefs == NULL)
         return 0;
     memset(pJPEG->pCoefs, 0, iSize);
+    pJPEG->uCoefsCheck = JPEG_COEFS_CHECK(pJPEG->pCoefs);
     pJPEG->iCoefKeep = iKeep;
     pJPEG->iCoefStride = iStride;
     return 1;
@@ -2705,13 +2744,15 @@ static int JPEGStartP(JPEGIMAGE *pJPEG)
     return 1;
 } /* JPEGStartP() */
 
+//
+// Free the coefficient buffer, if there is one: the JPEGIMAGE of an open() may hold what was left in memory
+//
 static void JPEGFreeP(JPEGIMAGE *pJPEG)
 {
-    if (pJPEG->pCoefs)
-    {
+    if (pJPEG->pCoefs && pJPEG->uCoefsCheck == JPEG_COEFS_CHECK(pJPEG->pCoefs))
         JPEG_FREE(pJPEG->pCoefs);
-        pJPEG->pCoefs = NULL;
-    }
+    pJPEG->pCoefs = NULL;
+    pJPEG->uCoefsCheck = 0;
 } /* JPEGFreeP() */
 //
 // Get a block of a progressive image from the coefficient buffer into the MCU buffer, as JPEGDecodeMCU() leaves
@@ -2955,6 +2996,17 @@ mcu_done:
     pJPEG->u16MCUFlags = u16MCUFlags;
     return 0;
 } /* JPEGDecodeMCU() */
+//
+// Get block iBlock of component iComp of MCU (x, y) to draw: decode it from the input, or for a progressive image
+// take it from the coefficients of its scans. Returns 0 for success, as JPEGDecodeMCU() does.
+//
+static inline int JPEGGetBlock(JPEGIMAGE *pJPEG, int iMCU, int iComp, int x, int y, int iBlock, int *iDCPredictor)
+{
+    if (pJPEG->pCoefs == NULL)
+        return JPEGDecodeMCU(pJPEG, iMCU, iDCPredictor);
+    JPEGGetBlockP(pJPEG, iMCU, iComp, x, y, iBlock, iDCPredictor);
+    return 0;
+} /* JPEGGetBlock() */
 //
 // Inverse DCT
 //
@@ -5662,8 +5714,12 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
 //
 static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
 {
+    if (pJPEG->bDecoded) // its input and fixed quantization tables are used up: open it again to decode it again
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
     pJPEG->bDecodeActive = 0;
-    JPEGFreeP(pJPEG); // from a decode that did not finish
     // Requested the Exif thumbnail
     if (pJPEG->iOptions & JPEG_EXIF_THUMBNAIL)
     {
@@ -5697,7 +5753,7 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
         return 0;
     // reorder and fix the quantization table for decoding; last, so that a decodeBegin() that failed can be retried
     JPEGFixQuantD(pJPEG);
-    pJPEG->bDecodeActive = 1;
+    pJPEG->bDecodeActive = pJPEG->bDecoded = 1;
     return 1;
 } /* JPEGDecodeStart() */
 //
@@ -5727,6 +5783,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
     int iCropX, iCropY, iCropCX, iCropCY; // the crop area at the output scale
+    int bFromCoefs; // a progressive image, drawn from the coefficients of its scans rather than from the input
 
     if (!pJPEG->bDecodeActive || iRows < 1)
     {
@@ -5745,6 +5802,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
         if (i != 1 || iRows < 1) // waiting for input, or no rows left to draw in this call
             return (i == 1) ? JPEG_DECODE_MORE : i;
     }
+    bFromCoefs = (pJPEG->pCoefs != NULL);
     pAlignedPixels = pJPEG->pAlignedPixels;
     // Fast downscaling options
     if (pJPEG->iOptions & JPEG_SCALE_HALF)
@@ -5912,7 +5970,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
         for (x = iStartCol, iStartCol = 0; x < cx && bContinue && iErr == 0; x++)
         {
             // Wait for input rather than decode past the end of what has arrived
-            if (bCanPause && pJPEG->ucMode != 0xc2 && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize &&
+            if (bCanPause && !bFromCoefs && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize &&
                 pJPEG->iVLCSize - pJPEG->iVLCOff < JPEG_INPUT_MARGIN)
             {
                 JPEGGetMoreData(pJPEG);
@@ -5937,11 +5995,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
             pJPEG->ucACTable = cACTable0;
             pJPEG->ucDCTable = cDCTable0;
             // do the first luminance component
-            if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
-                JPEGGetBlockP(pJPEG, iLum0 | iSkipMask, 0, x, y, 0, &iDCPred0);
-            } else {
-                iErr = JPEGDecodeMCU(pJPEG, iLum0 | iSkipMask, &iDCPred0);
-            }
+            iErr = JPEGGetBlock(pJPEG, iLum0 | iSkipMask, 0, x, y, 0, &iDCPred0);
             if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
             {
                 pl = (uint32_t *)&pJPEG->sMCUs[iLum0];
@@ -5958,11 +6012,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
             // do the second luminance component
             if (pJPEG->ucSubSample > 0x11) // subsampling
             {
-                if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
-                    JPEGGetBlockP(pJPEG, iLum1 | iSkipMask, 0, x, y, 1, &iDCPred0);
-                } else {
-                    iErr |= JPEGDecodeMCU(pJPEG, iLum1 | iSkipMask, &iDCPred0);
-                }
+                iErr |= JPEGGetBlock(pJPEG, iLum1 | iSkipMask, 0, x, y, 1, &iDCPred0);
                 if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                 {
                     c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
@@ -5978,11 +6028,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                 }
                 if (pJPEG->ucSubSample == 0x22)
                 {
-                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
-                        JPEGGetBlockP(pJPEG, iLum2 | iSkipMask, 0, x, y, 2, &iDCPred0);
-                    } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iLum2 | iSkipMask, &iDCPred0);
-                    }
+                    iErr |= JPEGGetBlock(pJPEG, iLum2 | iSkipMask, 0, x, y, 2, &iDCPred0);
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
                         c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
@@ -5996,11 +6042,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     {
                         JPEGIDCT(pJPEG, iLum2, pJPEG->JPCI[0].quant_tbl_no); // first quantization table
                     }
-                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
-                        JPEGGetBlockP(pJPEG, iLum3 | iSkipMask, 0, x, y, 3, &iDCPred0);
-                    } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iLum3 | iSkipMask, &iDCPred0);
-                    }
+                    iErr |= JPEGGetBlock(pJPEG, iLum3 | iSkipMask, 0, x, y, 3, &iDCPred0);
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
                         c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
@@ -6023,16 +6065,12 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                 pJPEG->ucDCTable = cDCTable1;
                 if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
                     // We're not going to use the color channels, so avoid as much work as possible
-                    if (pJPEG->ucMode != 0xc2) { // a progressive image has no data to pass over here
+                    if (!bFromCoefs) { // a progressive image has no data to pass over here
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1); // decode Cr block
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
                     }
                 } else {
-                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
-                        JPEGGetBlockP(pJPEG, iCr | iSkipMask, 1, x, y, 0, &iDCPred1);
-                    } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iCr | iSkipMask, &iDCPred1);
-                    }
+                    iErr |= JPEGGetBlock(pJPEG, iCr | iSkipMask, 1, x, y, 0, &iDCPred1);
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
                         c = ucRangeTable[((iDCPred1 * iQuant2) >> 5) & 0x3ff];
@@ -6049,11 +6087,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     // second chroma
                     pJPEG->ucACTable = cACTable2;
                     pJPEG->ucDCTable = cDCTable2;
-                    if (pJPEG->ucMode == 0xc2) { // progressive, from the decoded scans
-                        JPEGGetBlockP(pJPEG, iCb | iSkipMask, 2, x, y, 0, &iDCPred2);
-                    } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iCb | iSkipMask, &iDCPred2);
-                    }
+                    iErr |= JPEGGetBlock(pJPEG, iCb | iSkipMask, 2, x, y, 0, &iDCPred2);
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
                         c = ucRangeTable[((iDCPred2 * iQuant3) >> 5) & 0x3ff];
@@ -6156,21 +6190,24 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     iPitch = (iPitch + (mcuCX-1)) & ~(mcuCX-1);
                 }
             }
-            if (pJPEG->iResInterval && pJPEG->ucMode != 0xc2) // a progressive image is drawn from memory
+            if (!bFromCoefs) // the input of a baseline image; a progressive image is drawn from memory
             {
-                if (--pJPEG->iResCount == 0)
+                if (pJPEG->iResInterval)
                 {
-                    pJPEG->iResCount = pJPEG->iResInterval;
-                    iDCPred0 = iDCPred1 = iDCPred2 = 0; // reset DC predictors
-                    if (pJPEG->bb.ulBitOff & 7) // need to start at the next even byte
+                    if (--pJPEG->iResCount == 0)
                     {
-                        pJPEG->bb.ulBitOff += (8 - (pJPEG->bb.ulBitOff & 7));  // new restart interval starts on byte boundary
-                    }
-                } // if restart interval needs to reset
-            } // if there is a restart interval
-            // See if we need to feed it more data
-            if (pJPEG->iVLCOff >= FILE_HIGHWATER && pJPEG->ucMode != 0xc2)
-                JPEGGetMoreData(pJPEG); // need more 'filtered' VLC data
+                        pJPEG->iResCount = pJPEG->iResInterval;
+                        iDCPred0 = iDCPred1 = iDCPred2 = 0; // reset DC predictors
+                        if (pJPEG->bb.ulBitOff & 7) // need to start at the next even byte
+                        {
+                            pJPEG->bb.ulBitOff += (8 - (pJPEG->bb.ulBitOff & 7));  // new restart interval starts on byte boundary
+                        }
+                    } // if restart interval needs to reset
+                } // if there is a restart interval
+                // See if we need to feed it more data
+                if (pJPEG->iVLCOff >= FILE_HIGHWATER)
+                    JPEGGetMoreData(pJPEG); // need more 'filtered' VLC data
+            }
         } // for x
         if (bPaused)
             break;

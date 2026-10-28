@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 // The coefficient buffer comes from these, which count the buffers held and can be made to fail
@@ -30,6 +31,10 @@ static void test_free(void *p) {
 
 #include "../../src/JPEGDEC.h"
 #include "../../src/JPEGDEC.cpp"
+
+// A copy would free the coefficient buffer twice
+static_assert(!std::is_copy_constructible<JPEGDEC>::value && !std::is_copy_assignable<JPEGDEC>::value,
+              "JPEGDEC can be copied");
 
 struct Record {
   std::vector<int> geometry;
@@ -212,6 +217,48 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
   jpeg.close();
   if (jpeg.decodeRows(1) != 0 || jpeg.getLastError() != JPEG_INVALID_PARAMETER)
     fail("decodeRows() after close() not refused", 0);
+  // An image is decoded once per open(): a second decodeBegin() is refused, also part way through the first,
+  // which goes on as if it had not been called
+  (*checks)++;
+  Record ref, again;
+  int status;
+  open();
+  decode_open(jpeg, 0, &ref);
+  if (jpeg.decodeBegin(0, 0, 0) || jpeg.getLastError() != JPEG_INVALID_PARAMETER)
+    fail("second decodeBegin() not refused", 0);
+  jpeg.close();
+  open();
+  jpeg.setUserPointer(&again);
+  jpeg.decodeBegin(0, 0, 0);
+  jpeg.decodeRows(1);
+  if (jpeg.decodeBegin(0, 0, 0) || jpeg.decode(0, 0, 0))
+    fail("decodeBegin() part way through not refused", 0);
+  while ((status = jpeg.decodeRows(1000)) == JPEG_DECODE_MORE) {
+  }
+  if (status != 1 || again.geometry != ref.geometry || again.pixels != ref.pixels)
+    fail("decode after a refused decodeBegin() differs", 0);
+  jpeg.close();
+  // A JPEGDEC from malloc(), as JPEGDisplay makes, whose constructor did not run: open() does not free what is left
+  // in its memory, but does free the buffer of an image that was not finished
+  for (int fill : {0x00, 0xa5, 0xff}) {
+    (*checks)++;
+    void *raw = malloc(sizeof(JPEGDEC));
+    memset(raw, fill, sizeof(JPEGDEC));
+    auto *heap = static_cast<JPEGDEC *>(raw);
+    Record got;
+    if (!heap->open(&mem, size, close_cb, read_cb, seek_cb, draw_cb) || decode_open(*heap, 0, &got) != 1 ||
+        got.pixels != ref.pixels || g_buffers != 0)
+      fail("JPEGDEC from malloc() differs", fill);
+    heap->open(&mem, size, close_cb, read_cb, seek_cb, draw_cb);
+    heap->setUserPointer(&got);
+    heap->decodeBegin(0, 0, 0);
+    heap->decodeRows(1);
+    heap->open(&mem, size, close_cb, read_cb, seek_cb, draw_cb);
+    if (g_buffers != 0)
+      fail("JPEGDEC from malloc() kept the buffer", fill);
+    heap->close();
+    free(raw);
+  }
   // Color output after a decodeBegin() for grayscale, which keeps no chroma
   (*checks)++;
   open();
@@ -219,7 +266,6 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
   jpeg.setPixelType(EIGHT_BIT_GRAYSCALE);
   jpeg.decodeBegin(0, 0, 0);
   jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-  int status;
   while ((status = jpeg.decodeRows(1000)) == JPEG_DECODE_MORE) {
   }
   if (status != 1)
