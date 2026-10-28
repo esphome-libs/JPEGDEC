@@ -300,19 +300,20 @@ static int sof1_checks(const std::vector<uint8_t> &sof1, const char *name, int *
   for (int what = 0; what < 2; what++) {
     (*checks)++;
     std::vector<uint8_t> bad = sof1;
-    for (size_t i = 0; i + 8 < bad.size(); i++) {
+    for (size_t i = 0; i + 10 < bad.size(); i++) {
       if (bad[i] == 0xff && bad[i + 1] == 0xc1 && what == 0) {
         bad[i + 4] = 12; // bits per sample
         break;
       }
       if (bad[i] == 0xff && bad[i + 1] == 0xda && what == 1) {
-        bad[i + 8] = static_cast<uint8_t>((bad[i + 8] & 0xf0) | 2); // the second component's AC table, not defined
+        const int undefined = (bad[i + 10] & 0x0f) == 2 ? 3 : 2; // Cr uses one of AC tables 2 and 3
+        bad[i + 8] = static_cast<uint8_t>((bad[i + 8] & 0xf0) | undefined); // for Cb
         break;
       }
     }
     JPEGDEC jpeg;
     if (jpeg.openRAM(bad.data(), static_cast<int>(bad.size()), draw_cb) || jpeg.getLastError() != JPEG_UNSUPPORTED_FEATURE) {
-      printf("FAIL %s: %s not refused\n", name, what == 0 ? "12 bits per sample" : "AC table 2");
+      printf("FAIL %s: %s not refused\n", name, what == 0 ? "12 bits per sample" : "undefined AC table");
       failures++;
     }
   }

@@ -2,7 +2,7 @@
 
 Each baseline file also gets progressive twins from jpegtran, which holds the same coefficients, so prog_test
 can check that they decode to exactly the same pixels. A color one also gets an extended sequential (SOF1) twin
-whose Cr has a DC table of its own, numbered 2, as libjpeg writes when an image uses tables past 1. pairs.txt lists the
+whose Cr has DC and AC tables of its own, numbered past 1, as libjpeg writes when an image uses more than 2 tables. pairs.txt lists the
 twins. Any further arguments are more baseline files to make twins of.
 """
 
@@ -71,9 +71,10 @@ def twins(base: Path, out: Path, gray: bool) -> list[Path]:
     return made
 
 
-def sof1_twin(base: Path, out: Path) -> Path:
-    """An extended sequential copy of a baseline color file, whose Cr DC is coded with a copy of the luma DC table,
-    numbered 2. Every other bit of the scan stays as it was, so the coefficients are the same."""
+def sof1_twin(base: Path, out: Path, ac_table: int) -> Path:
+    """An extended sequential copy of a baseline color file, whose Cr is coded with copies of the luma DC and AC tables,
+    numbered 2 and ac_table, so each component has an AC table of its own. Every other bit of the scan stays as it was,
+    so the coefficients are the same."""
     data = base.read_bytes()
     segments, tables, i = [], {}, 2
     while data[i + 1] != 0xDA:
@@ -98,10 +99,11 @@ def sof1_twin(base: Path, out: Path) -> Path:
         segments.append(segment)
         i += 2 + length
     luma_dc = {v: c for c, v in tables[0x00][0].items()}
-    copy = b"\x02" + tables[0x00][1]
+    luma_ac = {v: c for c, v in tables[0x10][0].items()}
+    copy = b"\x02" + tables[0x00][1] + bytes([0x10 | ac_table]) + tables[0x10][1]
     segments.append(b"\xff\xc4" + (2 + len(copy)).to_bytes(2, "big") + copy)
     sos = bytearray(data[i : i + 2 + int.from_bytes(data[i + 2 : i + 4], "big")])
-    sos[5 + 2 * 3 - 1] = 0x20 | (sos[5 + 2 * 3 - 1] & 0x0F)  # Cr, the last of 3 components
+    sos[5 + 2 * 3 - 1] = 0x20 | ac_table  # Cr, the last of 3 components
     scan, k = bytearray(), i + len(sos)
     while not (data[k] == 0xFF and data[k + 1] != 0):
         scan.append(data[k])
@@ -134,6 +136,8 @@ def sof1_twin(base: Path, out: Path) -> Path:
                 n = 1
                 while n < 64:
                     rs = symbol(0x10 if comp == 0 else 0x11)
+                    if comp == 2:  # coded again with the luma AC table
+                        out_bits[-1] = luma_ac[rs]
                     if rs == 0:
                         break
                     extra(rs & 15)
@@ -156,7 +160,8 @@ def main(out: Path, more: list[Path]) -> None:
             base = out / f"{name}_{width}x{height}.jpg"
             rgb.save(base, quality=85, subsampling=subsampling)
             pairs += [(base, twin) for twin in twins(base, out, False)]
-            pairs.append((base, sof1_twin(base, out)))
+            # AC table 3 goes in the decoder's third slot, as table 2 does
+            pairs.append((base, sof1_twin(base, out, 3 if subsampling == 0 else 2)))
             rgb.save(
                 out / f"{name}_rst_{width}x{height}.jpg",
                 quality=85,

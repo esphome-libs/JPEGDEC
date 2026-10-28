@@ -10,7 +10,7 @@ Based on upstream 1.8.4, with:
 
 - **Decoding in steps**: `decodeBegin()` and `decodeRows()` decode a few MCU rows per call, and can wait for input that has not arrived yet
 - **Progressive images**: decoded in full at every scale, in steps and as their input arrives, where upstream only draws the first scan at 1/8 size
-- **Extended sequential images** (SOF1) with 8 bits per sample, decoded as baseline with up to 4 DC Huffman tables, as libjpeg writes when an image uses tables past 1 (Immich previews, for one); upstream refuses them
+- **Extended sequential images** (SOF1) with 8 bits per sample, decoded as baseline with up to 4 DC Huffman tables and up to 3 AC tables numbered 0-3, as libjpeg writes when an image uses tables past 1 (Immich previews, for one); upstream refuses them. Room for the third AC table adds 4 KB to `JPEGDEC`
 - **Fixes**: progressive images with skipped blocks, cropping with scaling, RGB8888 output of grayscale images, grayscale output of images whose two chroma components use different Huffman tables, NEON colour order, short reads in the input filter, AC coefficients whose code and extra bits straddle a refill, 1/4 scale RGB8888 output of 4:4:0 images, frames with more than 4 components
 - **ESP-IDF**: the ESP32-S3 SIMD colour conversion is used under ESP-IDF as well as Arduino
 - **Build**: compiled with `-O2`
