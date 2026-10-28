@@ -58,7 +58,7 @@
 #define JPEG_FILE_BUF_SIZE 2048
 #define HUFF_TABLEN  273
 #define HUFF11SIZE (1<<11)
-#define DC_TABLE_SIZE 1024
+#define DC_TABLE_SIZE 768 // codes up to 255, then the precalculated extra bits of the short ones at 512
 #define DCTSIZE 64
 #define MAX_MCU_COUNT 6
 #define MAX_COMPS_IN_SCAN 4
@@ -264,7 +264,7 @@ typedef struct jpeg_image_tag
     void *pFramebuffer;
     int16_t sQuantTable[DCTSIZE*4]; // quantization tables
     uint8_t ucFileBuf[JPEG_FILE_BUF_SIZE]; // holds temp data and pixel stack
-    uint8_t ucHuffDC[DC_TABLE_SIZE * 2]; // up to 2 'short' tables
+    uint8_t ucHuffDC[DC_TABLE_SIZE * 4]; // up to 4 'short' tables, as extended sequential images can have
     uint16_t usHuffAC[HUFF11SIZE * 2];
 } JPEGIMAGE;
 

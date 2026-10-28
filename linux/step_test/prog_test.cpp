@@ -2,7 +2,7 @@
 // made from by jpegtran, which holds the same DCT coefficients, whether it is decoded in one call or in steps as its
 // bytes trickle in. Also checks that a progressive file cut short still draws the whole image, from the scans that
 // arrived. The pairs of files are listed in the file named on the command line, a baseline and a progressive file
-// on each line.
+// on each line. The second file can also be an extended sequential (SOF1) twin, which gets the same comparisons.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -294,6 +294,31 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
   return failures;
 }
 
+// An extended sequential file with 12 bits per sample, or a scan that uses an AC table past 1, is refused
+static int sof1_checks(const std::vector<uint8_t> &sof1, const char *name, int *checks) {
+  int failures = 0;
+  for (int what = 0; what < 2; what++) {
+    (*checks)++;
+    std::vector<uint8_t> bad = sof1;
+    for (size_t i = 0; i + 8 < bad.size(); i++) {
+      if (bad[i] == 0xff && bad[i + 1] == 0xc1 && what == 0) {
+        bad[i + 4] = 12; // bits per sample
+        break;
+      }
+      if (bad[i] == 0xff && bad[i + 1] == 0xda && what == 1) {
+        bad[i + 8] = static_cast<uint8_t>((bad[i + 8] & 0xf0) | 2); // the second component's AC table, not defined
+        break;
+      }
+    }
+    JPEGDEC jpeg;
+    if (jpeg.openRAM(bad.data(), static_cast<int>(bad.size()), draw_cb) || jpeg.getLastError() != JPEG_UNSUPPORTED_FEATURE) {
+      printf("FAIL %s: %s not refused\n", name, what == 0 ? "12 bits per sample" : "AC table 2");
+      failures++;
+    }
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -366,6 +391,12 @@ int main(int argc, char **argv) {
           failures++;
         }
       }
+    }
+    JPEGDEC probe;
+    probe.openRAM(const_cast<uint8_t *>(prog.data()), static_cast<int>(prog.size()), draw_cb);
+    if (probe.getJPEGType() != JPEG_MODE_PROGRESSIVE) {
+      failures += sof1_checks(prog, prog_name, &checks);
+      continue;
     }
     failures += edge_checks(prog, prog_name, &checks);
     // Cut short: the whole image is still drawn, from what arrived

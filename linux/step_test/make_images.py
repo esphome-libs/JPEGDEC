@@ -1,8 +1,9 @@
 """Write the JPEG files that the tests decode, covering the layouts JPEGDEC handles.
 
 Each baseline file also gets progressive twins from jpegtran, which holds the same coefficients, so prog_test
-can check that they decode to exactly the same pixels. pairs.txt lists the twins. Any further arguments are
-more baseline files to make twins of.
+can check that they decode to exactly the same pixels. A color one also gets an extended sequential (SOF1) twin
+whose Cr has a DC table of its own, numbered 2, as libjpeg writes when an image uses tables past 1. pairs.txt lists the
+twins. Any further arguments are more baseline files to make twins of.
 """
 
 import subprocess
@@ -70,6 +71,81 @@ def twins(base: Path, out: Path, gray: bool) -> list[Path]:
     return made
 
 
+def sof1_twin(base: Path, out: Path) -> Path:
+    """An extended sequential copy of a baseline color file, whose Cr DC is coded with a copy of the luma DC table,
+    numbered 2. Every other bit of the scan stays as it was, so the coefficients are the same."""
+    data = base.read_bytes()
+    segments, tables, i = [], {}, 2
+    while data[i + 1] != 0xDA:
+        marker, length = data[i + 1], int.from_bytes(data[i + 2 : i + 4], "big")
+        segment = data[i : i + 2 + length]
+        if marker == 0xC0:
+            segment = b"\xff\xc1" + segment[2:]
+            sampling = [segment[11 + 3 * k] for k in range(segment[9])]
+            height, width = int.from_bytes(segment[5:7], "big"), int.from_bytes(segment[7:9], "big")
+        elif marker == 0xC4:  # every table of the segment: class and number, 16 counts, then the values
+            j = 4
+            while j < len(segment):
+                counts, size = segment[j + 1 : j + 17], 17 + sum(segment[j + 1 : j + 17])
+                codes, code, values = {}, 0, iter(segment[j + 17 : j + size])
+                for bits, count in enumerate(counts, 1):
+                    for _ in range(count):
+                        codes[format(code, f"0{bits}b")] = next(values)
+                        code += 1
+                    code <<= 1
+                tables[segment[j]] = (codes, segment[j + 1 : j + size])
+                j += size
+        segments.append(segment)
+        i += 2 + length
+    luma_dc = {v: c for c, v in tables[0x00][0].items()}
+    copy = b"\x02" + tables[0x00][1]
+    segments.append(b"\xff\xc4" + (2 + len(copy)).to_bytes(2, "big") + copy)
+    sos = bytearray(data[i : i + 2 + int.from_bytes(data[i + 2 : i + 4], "big")])
+    sos[5 + 2 * 3 - 1] = 0x20 | (sos[5 + 2 * 3 - 1] & 0x0F)  # Cr, the last of 3 components
+    scan, k = bytearray(), i + len(sos)
+    while not (data[k] == 0xFF and data[k + 1] != 0):
+        scan.append(data[k])
+        k += 1 + (data[k] == 0xFF)  # a stuffed zero
+    bits = "".join(format(b, "08b") for b in scan)
+    pos, out_bits = 0, []
+
+    def symbol(table: int) -> int:
+        nonlocal pos
+        for n in range(1, 17):
+            if bits[pos : pos + n] in tables[table][0]:
+                out_bits.append(bits[pos : pos + n])
+                pos += n
+                return tables[table][0][bits[pos - n : pos]]
+        raise ValueError("bad Huffman code")
+
+    def extra(n: int) -> None:
+        nonlocal pos
+        out_bits.append(bits[pos : pos + n])
+        pos += n
+
+    h, v = sampling[0] >> 4, sampling[0] & 15
+    for _ in range(-(-width // (8 * h)) * -(-height // (8 * v))):
+        for comp, blocks in ((0, h * v), (1, 1), (2, 1)):
+            for _ in range(blocks):
+                s = symbol(0x00 if comp == 0 else 0x01)
+                if comp == 2:  # coded again with the luma DC table
+                    out_bits[-1] = luma_dc[s]
+                extra(s)
+                n = 1
+                while n < 64:
+                    rs = symbol(0x10 if comp == 0 else 0x11)
+                    if rs == 0:
+                        break
+                    extra(rs & 15)
+                    n += 16 if rs == 0xF0 else (rs >> 4) + 1
+    packed = "".join(out_bits)
+    packed += "1" * (-len(packed) % 8)
+    body = bytes(int(packed[j : j + 8], 2) for j in range(0, len(packed), 8)).replace(b"\xff", b"\xff\x00")
+    twin = out / f"twin_sof1_{base.name}"
+    twin.write_bytes(data[:2] + b"".join(segments) + bytes(sos) + body + b"\xff\xd9")
+    return twin
+
+
 def main(out: Path, more: list[Path]) -> None:
     out.mkdir(parents=True, exist_ok=True)
     pairs = []
@@ -80,6 +156,7 @@ def main(out: Path, more: list[Path]) -> None:
             base = out / f"{name}_{width}x{height}.jpg"
             rgb.save(base, quality=85, subsampling=subsampling)
             pairs += [(base, twin) for twin in twins(base, out, False)]
+            pairs.append((base, sof1_twin(base, out)))
             rgb.save(
                 out / f"{name}_rst_{width}x{height}.jpg",
                 quality=85,

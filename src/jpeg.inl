@@ -1145,6 +1145,12 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     
     if (pJPEG->ucMode == 0xc2) // progressive images have their own tables
         return JPEGMakeHuffTablesP(pJPEG, pJPEG->ucHuffTableUsed);
+    // There is room for AC tables 0 and 1 only; a table that is not defined would be read past the end of usHuffAC
+    for (j=0; j<pJPEG->ucNumComponents; j++)
+    {
+        if (pJPEG->JPCI[j].component_needed && pJPEG->JPCI[j].ac_tbl_no > 1)
+            return 0;
+    }
     iTablesUsed = 0;
     pHuffVals = (uint8_t *)pJPEG->usPixels;
     for (j=0; j<4; j++)
@@ -1761,7 +1767,6 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
         }
         switch (usMarker)
         {
-            case 0xffc1: // extended mode
             case 0xffc3: // lossless mode
                 pPage->iError = JPEG_UNSUPPORTED_FEATURE;
                 return 0; // currently unsupported modes
@@ -1792,8 +1797,14 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                 }
                 break;
             case 0xffc0: // SOFx - start of frame (baseline)
+            case 0xffc1: // extended sequential: with 8 bits per sample, baseline with up to 4 Huffman tables of each kind
             case 0xffc2: // (progressive)
-                pPage->ucMode = (uint8_t)usMarker;
+                if (usMarker == 0xffc1 && s[iOffset+2] != 8)
+                {
+                    pPage->iError = JPEG_UNSUPPORTED_FEATURE;
+                    return 0;
+                }
+                pPage->ucMode = (usMarker == 0xffc2) ? 0xc2 : 0xc0; // extended sequential is decoded as baseline
                 pPage->ucBpp = s[iOffset+2]; // bits per sample
                 pPage->iCropX = pPage->iCropY = 0; // initialize crop rectangle to full image size
                 pPage->iCropCY = pPage->iHeight = MOTOSHORT(&s[iOffset+3]);
@@ -5776,7 +5787,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     int iDMASize, iDMAOffset;
     uint16_t *pAlignedPixels;
     uint8_t c;
-    int iMCUCount, xoff, iPitch, bThumbnail = 0;
+    int iMCUCount, xoff = 0, iPitch = 0, bThumbnail = 0; // xoff and iPitch are saved for a paused row even when no row is decoded
     int bContinue = 1; // early exit if the DRAW callback wants to stop
     uint32_t l, *pl;
     unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
@@ -6067,6 +6078,8 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
                     // We're not going to use the color channels, so avoid as much work as possible
                     if (!bFromCoefs) { // a progressive image has no data to pass over here
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1); // decode Cr block
+                        pJPEG->ucACTable = cACTable2; // its tables can differ from the first chroma's
+                        pJPEG->ucDCTable = cDCTable2;
                         iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
                     }
                 } else {
