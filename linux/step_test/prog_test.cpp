@@ -581,7 +581,7 @@ static int32_t read_file_cb(JPEGFILE *f, uint8_t *buf, int32_t len) {
   return n;
 }
 
-// close() can be called any number of times, also after an open() that found no file
+// Who closes a file. close() can be called any number of times, also after an open() that found no file.
 static int file_handle_checks(const std::vector<uint8_t> &prog, const char *name, int *checks) {
   int failures = 0;
   const auto check = [&](bool good, const char *what) {
@@ -606,6 +606,44 @@ static int file_handle_checks(const std::vector<uint8_t> &prog, const char *name
     jpeg.close();
     check(g_files_open == 0, "close() with no file");
   }
+  // The destructor closes a file opened by name, not one passed in, which can be gone by then
+  {
+    JPEGDEC jpeg;
+    jpeg.open("file", open_file_cb, close_file_cb, read_file_cb, seek_cb, draw_cb);
+  }
+  check(g_files_open == 0, "destructor left a file open");
+  {
+    CountedFile passed{true};
+    {
+      JPEGDEC jpeg;
+      jpeg.open(&passed, static_cast<int>(g_file_data.size()), close_file_cb, read_file_cb, seek_cb, draw_cb);
+    }
+    check(passed.open, "destructor closed a file passed in");
+  }
+  // Opening another image closes a file opened by name, but not one passed in
+  {
+    JPEGDEC jpeg;
+    jpeg.open("file", open_file_cb, close_file_cb, read_file_cb, seek_cb, draw_cb);
+    jpeg.open("file", open_file_cb, close_file_cb, read_file_cb, seek_cb, draw_cb);
+    check(g_files_open == 1, "opening another image left a file open");
+    g_files_open = 1;
+    CountedFile passed{true};
+    jpeg.open(&passed, static_cast<int>(g_file_data.size()), close_file_cb, read_file_cb, seek_cb, draw_cb);
+    check(g_files_open == 0, "opening a file passed in left a file open");
+    jpeg.openRAM(g_file_data.data(), static_cast<int>(g_file_data.size()), draw_cb);
+    check(passed.open, "opening another image closed a file passed in");
+  }
+  // A file opened by name is closed if it is not a good image, whether or not close() is called
+  const std::vector<uint8_t> good = g_file_data;
+  g_file_data.assign(4096, 0x55);
+  {
+    JPEGDEC jpeg;
+    const int opened = jpeg.open("file", open_file_cb, close_file_cb, read_file_cb, seek_cb, draw_cb);
+    check(!opened && jpeg.getLastError() == JPEG_INVALID_FILE && g_files_open == 0, "a bad file left open");
+    jpeg.close();
+    check(g_files_open == 0, "close() of a bad file");
+  }
+  g_file_data = good;
   return failures;
 }
 
