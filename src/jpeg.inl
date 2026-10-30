@@ -1811,7 +1811,7 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
             case 0xffc0: // SOFx - start of frame (baseline)
             case 0xffc1: // extended sequential: with 8 bits per sample, baseline with up to 4 Huffman tables of each kind
             case 0xffc2: // (progressive)
-                if (usMarker == 0xffc1 && s[iOffset+2] != 8)
+                if (usMarker != 0xffc0 && s[iOffset+2] != 8) // these can have 12 bits per sample, which is not decoded
                 {
                     pPage->iError = JPEG_UNSUPPORTED_FEATURE;
                     return 0;

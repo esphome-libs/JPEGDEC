@@ -159,6 +159,20 @@ static int decode_open(JPEGDEC &jpeg, int options, Record *rec) {
   return status;
 }
 
+// The offset of the next FF marker at or after from, or 0. Only for markers before the data of the first scan.
+static size_t find_marker(const std::vector<uint8_t> &f, uint8_t marker, size_t from = 2) {
+  for (size_t i = from; i + 1 < f.size(); i++) {
+    if (f[i] == 0xff && f[i + 1] == marker)
+      return i;
+    if (f[i] == 0xff && f[i + 1] == 0xda)
+      return 0;
+    if (f[i] == 0xff && f[i + 1] >= 0xc0 && f[i + 1] != 0xff) { // over the segment, whose bytes can look like a marker
+      i += 1 + ((f[i + 2] << 8) | f[i + 3]);
+    }
+  }
+  return 0;
+}
+
 // Running out of memory, decoding after close(), opening another image part way through and bad frame sizes
 static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *checks) {
   static JPEGDEC jpeg;
@@ -289,6 +303,12 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
       jpeg.close();
     }
   }
+  // 12 bits per sample is refused
+  (*checks)++;
+  std::vector<uint8_t> deep = prog;
+  deep[find_marker(deep, 0xc2) + 4] = 12;
+  if (jpeg.openRAM(deep.data(), size, draw_cb) || jpeg.getLastError() != JPEG_UNSUPPORTED_FEATURE)
+    fail("12 bits per sample not refused", 0);
   if (g_buffers != 0)
     fail("buffers left", 0);
   return failures;
@@ -318,20 +338,6 @@ static int sof1_checks(const std::vector<uint8_t> &sof1, const char *name, int *
     }
   }
   return failures;
-}
-
-// The offset of the next FF marker at or after from, or 0. Only for markers before the data of the first scan.
-static size_t find_marker(const std::vector<uint8_t> &f, uint8_t marker, size_t from = 2) {
-  for (size_t i = from; i + 1 < f.size(); i++) {
-    if (f[i] == 0xff && f[i + 1] == marker)
-      return i;
-    if (f[i] == 0xff && f[i + 1] == 0xda)
-      return 0;
-    if (f[i] == 0xff && f[i + 1] >= 0xc0 && f[i + 1] != 0xff) { // over the segment, whose bytes can look like a marker
-      i += 1 + ((f[i + 2] << 8) | f[i + 3]);
-    }
-  }
-  return 0;
 }
 
 // A copy of the file whose quantization tables have 2 added to their numbers, in the DQT and SOF segments
