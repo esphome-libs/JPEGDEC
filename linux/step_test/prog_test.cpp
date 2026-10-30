@@ -477,6 +477,35 @@ static int dqt_between_scans_checks(const std::vector<uint8_t> &prog, const char
   return 0;
 }
 
+// A scan cut short by a marker draws the same as one cut short by the end of the file: its last block reads zeros,
+// not the bytes of the segment after it
+static int scan_cut_by_marker_checks(const std::vector<uint8_t> &prog, const char *name, const Config &c, int *checks) {
+  int failures = 0;
+  size_t last_sos = 0;
+  for (size_t i = 2; i + 1 < prog.size(); i++) {
+    if (prog[i] == 0xff && prog[i + 1] == 0xda)
+      last_sos = i;
+  }
+  for (int percent : {20, 50, 80}) {
+    (*checks)++;
+    size_t cut = last_sos + 16 + (prog.size() - last_sos - 16) * percent / 100;
+    while (prog[cut - 1] == 0xff || prog[cut] == 0xff)
+      cut--;
+    const std::vector<uint8_t> at_end(prog.begin(), prog.begin() + cut);
+    std::vector<uint8_t> at_marker = at_end;
+    at_marker.insert(at_marker.end(), {0xff, 0xfe, 0x01, 0x02}); // a comment of 256 bytes that do not look like zeros
+    at_marker.insert(at_marker.end(), 256, 0x5a);
+    at_marker.insert(at_marker.end(), {0xff, 0xd9});
+    const Result ref = run(at_end, c, 0, 0), got = run(at_marker, c, 0, 0);
+    if (got.status != ref.status || got.record.pixels != ref.record.pixels) {
+      printf("FAIL %s: a scan cut %d%% of the way through by a marker differs (status %d/%d error %d)\n", name, percent,
+             got.status, ref.status, got.error);
+      failures++;
+    }
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -566,6 +595,8 @@ int main(int argc, char **argv) {
       continue;
     }
     failures += edge_checks(prog, prog_name, &checks);
+    if (prog.size() > 2048)
+      failures += scan_cut_by_marker_checks(prog, prog_name, configs[0], &checks);
     if (strstr(prog_name, "scans_spectral") != nullptr)
       failures += dqt_between_scans_checks(prog, prog_name, configs[0], &checks);
     // Cut short: the whole image is still drawn, from what arrived

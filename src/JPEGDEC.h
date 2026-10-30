@@ -247,6 +247,7 @@ typedef struct jpeg_image_tag
     int iEOBRun; // blocks left in a run with no more AC coefficients
     int iSkipLen; // bytes left of a marker segment being passed over between scans
     int iRawOff, iRawSize; // input not yet filtered or parsed, in ucFileBuf after the filtered data
+    int iRawSaved; // bytes at iRawOff kept aside while zeros stand in for them, after a marker cut a scan short
     uint8_t ucScanComp; // the component of a scan with one component
     uint8_t ucProgState; // where the decode of the scans is
     uint8_t ucScanMarker; // the scan's data ends at the marker at iRawOff

@@ -2325,9 +2325,13 @@ static int JPEGFilterP(uint8_t *s, uint8_t *d, int iLen, int *piUsed, uint8_t *p
 //
 // The filtered data of a scan ends this far before the end of ucFileBuf. The bit reader loads 8 bytes at a time,
 // and a block of bad data can take it past the end of the data before that is noticed: a block reads at most 63
-// codes of 16 bits with 15 more bits each, under 250 bytes.
+// codes of 16 bits with 15 more bits each, under 250 bytes. Past the end of a scan that is cut short it reads zeros.
 //
-#define JPEGP_VLC_SIZE (JPEG_FILE_BUF_SIZE - 320)
+#define JPEGP_PAD_SIZE 320
+#define JPEGP_VLC_SIZE (JPEG_FILE_BUF_SIZE - JPEGP_PAD_SIZE)
+// Where the input moved aside for those zeros waits: usPixels is not drawn to during the scans, and the Huffman values
+// that JPEGGetHuffTables() leaves in it take the first 8 tables' worth
+#define JPEGP_SAVED(pJPEG) (&((uint8_t *)(pJPEG)->usPixels)[8 * HUFF_TABLEN])
 //
 // Read more input after what ucFileBuf holds; returns the number of bytes read
 //
@@ -2379,8 +2383,22 @@ static int JPEGGetMoreDataP(JPEGIMAGE *pJPEG)
         iRawEnd = (pJPEG->iRawSize < JPEGP_VLC_SIZE) ? pJPEG->iRawSize : JPEGP_VLC_SIZE; // filtered data is no longer
         pJPEG->iVLCSize += JPEGFilterP(&pBuf[pJPEG->iRawOff], &pBuf[pJPEG->iVLCSize], iRawEnd - pJPEG->iRawOff, &iUsed, &pJPEG->ucScanMarker);
         pJPEG->iRawOff += iUsed;
-        if (!JPEGMoreDataP(pJPEG) && !pJPEG->ucScanMarker) // the file ends before the scan
+        if (pJPEG->ucScanMarker) // a marker ends the scan: its last block reads zeros, so the input there moves aside
+        {
+            iRawLen = pJPEG->iVLCSize + JPEGP_PAD_SIZE - pJPEG->iRawOff;
+            if (iRawLen > pJPEG->iRawSize - pJPEG->iRawOff)
+                iRawLen = pJPEG->iRawSize - pJPEG->iRawOff;
+            if (iRawLen > 0)
+            {
+                memcpy(JPEGP_SAVED(pJPEG), &pBuf[pJPEG->iRawOff], iRawLen);
+                pJPEG->iRawSaved = iRawLen;
+            }
+            memset(&pBuf[pJPEG->iVLCSize], 0, JPEGP_PAD_SIZE);
+        }
+        else if (!JPEGMoreDataP(pJPEG)) // the file ends before the scan
+        {
             memset(&pBuf[pJPEG->iVLCSize], 0, JPEG_FILE_BUF_SIZE - pJPEG->iVLCSize); // its last block reads zeros
+        }
     }
     pJPEG->bb.ulBits = MOTOLONG(pBuf);
     return iRead;
@@ -2472,6 +2490,11 @@ static int JPEGStartScanP(JPEGIMAGE *pJPEG)
 //
 static void JPEGEndScanP(JPEGIMAGE *pJPEG)
 {
+    if (pJPEG->iRawSaved) // the input that zeros stood in for
+    {
+        memcpy(&pJPEG->ucFileBuf[pJPEG->iRawOff], JPEGP_SAVED(pJPEG), pJPEG->iRawSaved);
+        pJPEG->iRawSaved = 0;
+    }
     pJPEG->iVLCOff = pJPEG->iVLCSize;
     pJPEG->ucProgState = JPEG_PROG_HEADER;
 } /* JPEGEndScanP() */
