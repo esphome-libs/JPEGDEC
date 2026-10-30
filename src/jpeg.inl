@@ -1885,7 +1885,11 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
 //        if (pPage->ucBpp != 8) // need to match up table IDs
 //        {
             iOffset -= usLen;
-            JPEGGetSOS(pPage, &iOffset); // get Start-Of-Scan info for decoding
+            if (JPEGGetSOS(pPage, &iOffset) != 0) // get Start-Of-Scan info for decoding
+            {
+                pPage->iError = JPEG_DECODE_ERROR;
+                return 0;
+            }
 //        }
         if (!JPEGMakeHuffTables(pPage, 0)) //int bThumbnail) DEBUG
         {

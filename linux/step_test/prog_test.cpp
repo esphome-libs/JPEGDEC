@@ -394,6 +394,32 @@ static int sampling_checks(const std::vector<uint8_t> &file, const char *name, i
   return failures;
 }
 
+// A first scan header that is bad is refused when the image is opened, in any mode
+static int bad_sos_checks(const std::vector<uint8_t> &file, const char *name, int *checks) {
+  int failures = 0;
+  for (int what = 0; what < 3; what++) {
+    (*checks)++;
+    std::vector<uint8_t> bad = file;
+    size_t sos = 0;
+    for (size_t j = 2; sos == 0 && j + 1 < bad.size(); j += 2 + ((bad[j + 2] << 8) | bad[j + 3])) {
+      if (bad[j + 1] == 0xda)
+        sos = j;
+    }
+    if (what == 0)
+      bad[sos + 5] = 0xee; // a component that is not in the frame
+    else if (what == 1)
+      bad[sos + 3]++; // its length does not fit its number of components
+    else
+      bad[sos + 6] = 0x44; // a table number that cannot be
+    JPEGDEC jpeg;
+    if (jpeg.openRAM(bad.data(), static_cast<int>(bad.size()), draw_cb) || jpeg.getLastError() != JPEG_DECODE_ERROR) {
+      printf("FAIL %s: bad scan header %d not refused (error %d)\n", name, what, jpeg.getLastError());
+      failures++;
+    }
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -473,6 +499,8 @@ int main(int argc, char **argv) {
       failures += sampling_checks(base, base_name, &checks);
       failures += sampling_checks(prog, prog_name, &checks);
     }
+    failures += bad_sos_checks(base, base_name, &checks);
+    failures += bad_sos_checks(prog, prog_name, &checks);
     JPEGDEC probe;
     probe.openRAM(const_cast<uint8_t *>(prog.data()), static_cast<int>(prog.size()), draw_cb);
     if (probe.getJPEGType() != JPEG_MODE_PROGRESSIVE) {
