@@ -1671,6 +1671,17 @@ static int JPEGGetQuantTables(JPEGIMAGE *pJPEG, uint8_t *s, int iLen, int bFix)
         if ((ucTable & 0xf) > 3) // invalid table number
             return -1;
         iTableOffset = (ucTable & 0xf) * DCTSIZE;
+        if (bFix) // a component keeps the table that was defined when it had its first scan
+        {
+            for (i=0; i<pJPEG->ucNumComponents && i<3; i++)
+            {
+                if ((pJPEG->ucQuantScanned & ~pJPEG->ucQuantSaved & (1 << i)) && pJPEG->JPCI[i].quant_tbl_no == (ucTable & 0xf))
+                {
+                    memcpy(&pJPEG->pQuantSaved[i*DCTSIZE], &pJPEG->sQuantTable[iTableOffset], DCTSIZE*sizeof(int16_t));
+                    pJPEG->ucQuantSaved |= (uint8_t)(1 << i);
+                }
+            }
+        }
         if (ucTable & 0xf0) // if word precision
         {
             if (iLen < DCTSIZE*2 + 1) // not a whole table
@@ -2421,6 +2432,11 @@ static int JPEGStartScanP(JPEGIMAGE *pJPEG)
         pJPEG->iError = JPEG_DECODE_ERROR;
         return 0;
     }
+    for (i = 0; i < pJPEG->ucNumComponents; i++)
+    {
+        if (pJPEG->JPCI[i].component_needed)
+            pJPEG->ucQuantScanned |= (uint8_t)(1 << i);
+    }
     iHMax = pJPEG->JPCI[0].h_samp_factor; // the luma blocks are the most
     iVMax = pJPEG->JPCI[0].v_samp_factor;
     pJPEG->iScanX = pJPEG->iScanY = 0;
@@ -2702,8 +2718,23 @@ static int JPEGDecodeScansP(JPEGIMAGE *pJPEG, int *piRows, int bCanPause)
         if (i != 1)
             return i;
     }
+    if (pJPEG->ucQuantSaved) // some tables were redefined part way through: give each component the one it keeps
+    {
+        for (i = 0; i < pJPEG->ucNumComponents; i++)
+        {
+            if (!(pJPEG->ucQuantSaved & (1 << i)))
+                memcpy(&pJPEG->pQuantSaved[i*DCTSIZE], &pJPEG->sQuantTable[pJPEG->JPCI[i].quant_tbl_no*DCTSIZE], DCTSIZE*sizeof(int16_t));
+        }
+        for (i = 0; i < pJPEG->ucNumComponents; i++)
+        {
+            memcpy(&pJPEG->sQuantTable[i*DCTSIZE], &pJPEG->pQuantSaved[i*DCTSIZE], DCTSIZE*sizeof(int16_t));
+            pJPEG->JPCI[i].quant_tbl_no = (uint8_t)i;
+        }
+        pJPEG->ucQuantSaved = 0;
+    }
     return 1;
 } /* JPEGDecodeScansP() */
+#define JPEG_QUANT_SAVED_SIZE (3 * DCTSIZE * sizeof(int16_t))
 //
 // Allocate the coefficient buffer, keeping the first iKeep coefficients of each block in zigzag order, and when
 // that is not all of them and not only the DC, a nonzero flag for each of the rest
@@ -2714,13 +2745,15 @@ static int JPEGAllocCoefsP(JPEGIMAGE *pJPEG, int iBlocks, int iKeep)
     int iStride = iKeep + ((iKeep > 1 && iKeep < DCTSIZE) ? DCTSIZE / 16 : 0);
     size_t iSize;
 
-    if ((size_t)iBlocks > ((size_t)-1) / (iStride * sizeof(int16_t)))
+    if ((size_t)iBlocks > (((size_t)-1) - JPEG_QUANT_SAVED_SIZE) / (iStride * sizeof(int16_t)))
         return 0;
     iSize = (size_t)iBlocks * iStride * sizeof(int16_t);
-    pJPEG->pCoefs = (int16_t *)JPEG_MALLOC(iSize);
+    pJPEG->pCoefs = (int16_t *)JPEG_MALLOC(iSize + JPEG_QUANT_SAVED_SIZE);
     if (pJPEG->pCoefs == NULL)
         return 0;
     memset(pJPEG->pCoefs, 0, iSize);
+    pJPEG->pQuantSaved = &pJPEG->pCoefs[iSize / sizeof(int16_t)];
+    pJPEG->ucQuantScanned = pJPEG->ucQuantSaved = 0;
     pJPEG->uCoefsCheck = JPEG_COEFS_CHECK(pJPEG->pCoefs);
     pJPEG->iCoefKeep = iKeep;
     pJPEG->iCoefStride = iStride;

@@ -440,6 +440,43 @@ static int multi_scan_checks(const std::vector<uint8_t> &file, const char *name,
   return 0;
 }
 
+// Each component keeps the quantization table that was defined when it had its first scan. In a file with the luma
+// DC in a scan of its own, every component is made to use table 0, which is redefined after that scan as the table
+// that chroma used: it must decode as before.
+static int dqt_between_scans_checks(const std::vector<uint8_t> &prog, const char *name, const Config &c, int *checks) {
+  (*checks)++;
+  std::vector<uint8_t> f = prog;
+  const size_t sof = find_marker(f, 0xc2);
+  std::vector<uint8_t> chroma;
+  for (size_t i = find_marker(f, 0xdb); i != 0; i = find_marker(f, 0xdb, i + 2)) {
+    const size_t end = i + 2 + ((f[i + 2] << 8) | f[i + 3]);
+    for (size_t j = i + 4; j < end; j += 1 + ((f[j] >> 4) ? 128 : 64)) {
+      if (f[j] == 1)
+        chroma.assign(f.begin() + j + 1, f.begin() + j + 65);
+    }
+  }
+  if (chroma.empty())
+    return 0;
+  for (int comp = 0; comp < f[sof + 9]; comp++)
+    f[sof + 12 + 3 * comp] = 0;
+  size_t second_sos = 0;
+  for (size_t i = 2, seen = 0; i + 1 < f.size(); i++) {
+    if (f[i] == 0xff && f[i + 1] == 0xda && ++seen == 2) {
+      second_sos = i;
+      break;
+    }
+  }
+  std::vector<uint8_t> dqt = {0xff, 0xdb, 0, 67, 0};
+  dqt.insert(dqt.end(), chroma.begin(), chroma.end());
+  f.insert(f.begin() + second_sos, dqt.begin(), dqt.end());
+  const Result ref = run(prog, c, 0, 0), got = run(f, c, 0, 0);
+  if (got.status != 1 || got.record.pixels != ref.record.pixels) {
+    printf("FAIL %s: a table redefined between scans differs (status %d error %d)\n", name, got.status, got.error);
+    return 1;
+  }
+  return 0;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -529,6 +566,8 @@ int main(int argc, char **argv) {
       continue;
     }
     failures += edge_checks(prog, prog_name, &checks);
+    if (strstr(prog_name, "scans_spectral") != nullptr)
+      failures += dqt_between_scans_checks(prog, prog_name, configs[0], &checks);
     // Cut short: the whole image is still drawn, from what arrived
     const Config &c = configs[0];
     const Result ref = run(base, c, 0, 0);

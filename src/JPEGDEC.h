@@ -242,6 +242,8 @@ typedef struct jpeg_image_tag
     int iCoefPitch[MAX_COMPS_IN_SCAN]; // blocks per row of each component in pCoefs
     int iScanX, iScanY; // next MCU of the scan, or block when the scan has one component
     int iScanCX, iScanCY; // size of the scan in MCUs or blocks
+    int16_t *pQuantSaved; // a table per component after the coefficients, for tables redefined once it had a scan
+    uint8_t ucQuantScanned, ucQuantSaved; // the components that have had a scan, and whose table is in pQuantSaved
     int iEOBRun; // blocks left in a run with no more AC coefficients
     int iSkipLen; // bytes left of a marker segment being passed over between scans
     int iRawOff, iRawSize; // input not yet filtered or parsed, in ucFileBuf after the filtered data
