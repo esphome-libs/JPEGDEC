@@ -362,6 +362,32 @@ static int quant_number_checks(const std::vector<uint8_t> &file, const char *nam
   return 0;
 }
 
+// A copy of the file with the luma sampling factors of its frame changed
+static std::vector<uint8_t> set_luma_sampling(std::vector<uint8_t> f, uint8_t sampling) {
+  for (uint8_t sof : {0xc0, 0xc1, 0xc2}) {
+    const size_t i = find_marker(f, sof);
+    if (i != 0)
+      f[i + 11] = sampling;
+  }
+  return f;
+}
+
+// Sampling factors that JPEGDecodeRows() has no MCU layout for are refused, in any mode, rather than dividing by 0
+static int sampling_checks(const std::vector<uint8_t> &file, const char *name, int *checks) {
+  int failures = 0;
+  for (uint8_t sampling : {0x41, 0x14, 0x31, 0x44, 0x00}) {
+    (*checks)++;
+    std::vector<uint8_t> bad = set_luma_sampling(file, sampling);
+    JPEGDEC jpeg;
+    if (jpeg.openRAM(bad.data(), static_cast<int>(bad.size()), draw_cb) &&
+        (jpeg.decode(0, 0, 0) != 0 || jpeg.getLastError() != JPEG_UNSUPPORTED_FEATURE)) {
+      printf("FAIL %s: sampling %02x not refused (error %d)\n", name, sampling, jpeg.getLastError());
+      failures++;
+    }
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -437,6 +463,10 @@ int main(int argc, char **argv) {
     }
     failures += quant_number_checks(base, base_name, configs[0], &checks);
     failures += quant_number_checks(prog, prog_name, configs[0], &checks);
+    if (base[find_marker(base, 0xc0) + 9] == 3) {
+      failures += sampling_checks(base, base_name, &checks);
+      failures += sampling_checks(prog, prog_name, &checks);
+    }
     JPEGDEC probe;
     probe.openRAM(const_cast<uint8_t *>(prog.data()), static_cast<int>(prog.size()), draw_cb);
     if (probe.getJPEGType() != JPEG_MODE_PROGRESSIVE) {

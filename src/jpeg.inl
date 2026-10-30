@@ -2720,17 +2720,7 @@ static int JPEGStartP(JPEGIMAGE *pJPEG)
     int i, cx, cy, iKeep, iBlocks = 0;
     JPEGCOMPINFO *pComp = pJPEG->JPCI;
 
-    // Grayscale, or color with 1 to 2x2 luma blocks to each chroma block, as JPEGDecodeRows() draws
-    if (pJPEG->ucNumComponents == 3)
-    {
-        if (pComp[0].h_samp_factor < 1 || pComp[0].h_samp_factor > 2 || pComp[0].v_samp_factor < 1 || pComp[0].v_samp_factor > 2 ||
-            pComp[1].h_samp_factor != 1 || pComp[1].v_samp_factor != 1 || pComp[2].h_samp_factor != 1 || pComp[2].v_samp_factor != 1)
-        {
-            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
-            return 0;
-        }
-    }
-    else if (pJPEG->ucNumComponents != 1)
+    if (pJPEG->ucNumComponents != 1 && pJPEG->ucNumComponents != 3)
     {
         pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
         return 0;
@@ -5745,6 +5735,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
 //
 static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
 {
+    int i;
+
     if (pJPEG->bDecoded) // its input and fixed quantization tables are used up: open it again to decode it again
     {
         pJPEG->iError = JPEG_INVALID_PARAMETER;
@@ -5761,6 +5753,25 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
         }
         if (!JPEGParseInfo(pJPEG, 1)) // parse the embedded thumbnail file header
             return 0; // something went wrong
+    }
+    // Color with 1 to 2x2 luma blocks to each chroma block, as JPEGDecodeRows() draws, whatever the mode
+    if (pJPEG->ucNumComponents == 3)
+    {
+        for (i = 0; i < 3; i++)
+        {
+            if (pJPEG->JPCI[i].h_samp_factor < 1 || pJPEG->JPCI[i].h_samp_factor > (i ? 1 : 2) ||
+                pJPEG->JPCI[i].v_samp_factor < 1 || pJPEG->JPCI[i].v_samp_factor > (i ? 1 : 2))
+            {
+                pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+                return 0;
+            }
+        }
+    }
+    else if (pJPEG->ucSubSample != 0x00 && pJPEG->ucSubSample != 0x01 && pJPEG->ucSubSample != 0x11 &&
+             pJPEG->ucSubSample != 0x12 && pJPEG->ucSubSample != 0x21 && pJPEG->ucSubSample != 0x22)
+    {
+        pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+        return 0;
     }
     // One scale, in the order JPEGDecodeRows() picks it: the IDCT and the color conversion check them in other orders
     if (pJPEG->iOptions & JPEG_SCALE_HALF)
