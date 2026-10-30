@@ -5945,7 +5945,7 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
 //
 static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
 {
-    int cx, cy, x, y, yEnd, mcuCX, mcuCY, iStartCol, bPaused = 0;
+    int cx, cy, x, y, yEnd, mcuCX, mcuCY, iStartCol, iEndCol, bPaused = 0;
     int iLum0, iLum1, iLum2, iLum3, iCr, iCb;
     signed int iDCPred0, iDCPred1, iDCPred2;
     int i, iQuant1, iQuant2, iQuant3, iErr;
@@ -6120,6 +6120,18 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     y = pJPEG->iDecodeRow;
     yEnd = (iRows < cy - y) ? y + iRows : cy;
     iStartCol = pJPEG->iDecodeCol; // non-zero when resuming part way through a row
+    iEndCol = cx;
+    if (bFromCoefs) // nothing is read in order from memory, so what is outside the crop is not even passed over
+    {
+        if (y * mcuCY < iCropY)
+        {
+            y = iCropY / mcuCY;
+            yEnd = (iRows < cy - y) ? y + iRows : cy;
+        }
+        iEndCol = (iCropX + iCropCX) / mcuCX + 1; // the MCU just past the crop is also in the crop's output group
+        if (iEndCol > cx)
+            iEndCol = cx;
+    }
     for (; y < yEnd && bContinue && iErr == 0; y++)
     {
         bSkipRow = (y*mcuCY < iCropY);
@@ -6144,7 +6156,7 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
             iPitch = pJPEG->iDecodePitch;
             jd.x = pJPEG->iDecodeDrawX;
         }
-        for (x = iStartCol, iStartCol = 0; x < cx && bContinue && iErr == 0; x++)
+        for (x = (bFromCoefs ? iCropX / mcuCX : iStartCol), iStartCol = 0; x < iEndCol && bContinue && iErr == 0; x++)
         {
             // Wait for input rather than decode past the end of what has arrived
             if (bCanPause && !bFromCoefs && pJPEG->JPEGFile.iPos < pJPEG->JPEGFile.iSize &&

@@ -273,6 +273,26 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
     heap->~JPEGDEC();
     free(raw);
   }
+  // Drawing a crop takes the same number of decodeRows() calls wherever it is: rows above it are not passed over
+  {
+    (*checks)++;
+    int calls[2] = {0, 0};
+    for (int bottom = 0; bottom < 2; bottom++) {
+      open();
+      const int w = jpeg.getWidth(), h = jpeg.getHeight();
+      jpeg.setUserPointer(&rec);
+      jpeg.setCropArea(0, bottom ? (h & ~15) : 0, w, 16);
+      if (bottom && (h & 15) == 0) // only a whole row of MCUs
+        jpeg.setCropArea(0, h - 16, w, 16);
+      if (jpeg.decodeBegin(0, 0, 0)) {
+        while (jpeg.decodeRows(1) == JPEG_DECODE_MORE)
+          calls[bottom]++;
+      }
+      jpeg.close();
+    }
+    if (calls[1] > calls[0])
+      fail("a crop at the bottom takes more calls", 0);
+  }
   // Color output after a decodeBegin() for grayscale, which keeps no chroma
   (*checks)++;
   open();
