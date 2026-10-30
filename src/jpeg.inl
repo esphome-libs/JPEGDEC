@@ -1891,6 +1891,17 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                 return 0;
             }
 //        }
+        if (pPage->ucMode == 0xc0) // all of a sequential image is decoded from one scan, so it must hold every component
+        {
+            for (i=0; i<pPage->ucNumComponents && pPage->JPCI[i].component_needed; i++)
+            {
+            }
+            if (i != pPage->ucNumComponents)
+            {
+                pPage->iError = JPEG_UNSUPPORTED_FEATURE;
+                return 0;
+            }
+        }
         if (!JPEGMakeHuffTables(pPage, 0)) //int bThumbnail) DEBUG
         {
             pPage->iError = JPEG_UNSUPPORTED_FEATURE;

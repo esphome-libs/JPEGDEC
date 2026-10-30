@@ -420,6 +420,26 @@ static int bad_sos_checks(const std::vector<uint8_t> &file, const char *name, in
   return failures;
 }
 
+// A sequential image with a scan for each component is refused, not decoded from the first scan alone
+static int multi_scan_checks(const std::vector<uint8_t> &file, const char *name, int *checks) {
+  (*checks)++;
+  std::vector<uint8_t> bad = file;
+  size_t sos = 2;
+  while (bad[sos + 1] != 0xda)
+    sos += 2 + ((bad[sos + 2] << 8) | bad[sos + 3]);
+  // A header for the first component alone
+  const uint8_t header[] = {0xff, 0xda, 0, 8, 1, bad[sos + 5], bad[sos + 6], 0, 63, 0};
+  const size_t len = 2 + ((bad[sos + 2] << 8) | bad[sos + 3]);
+  bad.erase(bad.begin() + sos, bad.begin() + sos + len);
+  bad.insert(bad.begin() + sos, header, header + sizeof(header));
+  JPEGDEC jpeg;
+  if (jpeg.openRAM(bad.data(), static_cast<int>(bad.size()), draw_cb) || jpeg.getLastError() != JPEG_UNSUPPORTED_FEATURE) {
+    printf("FAIL %s: a scan of 1 of its components not refused (error %d)\n", name, jpeg.getLastError());
+    return 1;
+  }
+  return 0;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -498,6 +518,7 @@ int main(int argc, char **argv) {
     if (base[find_marker(base, 0xc0) + 9] == 3) {
       failures += sampling_checks(base, base_name, &checks);
       failures += sampling_checks(prog, prog_name, &checks);
+      failures += multi_scan_checks(base, base_name, &checks);
     }
     failures += bad_sos_checks(base, base_name, &checks);
     failures += bad_sos_checks(prog, prog_name, &checks);
