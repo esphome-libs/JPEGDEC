@@ -44,6 +44,8 @@ JPEGDEC::JPEGDEC()
 JPEGDEC::~JPEGDEC()
 {
     JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // a File or handle that was passed in can be gone by now, so only one opened here
+        JPEGCloseFileP(&_jpeg);
 } /* ~JPEGDEC() */
 
 void JPEGDEC::setFramebuffer(void *pFramebuffer)
