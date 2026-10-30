@@ -107,10 +107,6 @@ static void *JPEGMallocPSRAM(size_t size)
 #ifndef JPEG_FREE
 #define JPEG_FREE(p) free(p) // frees heap_caps_malloc() memory too
 #endif
-// Opening an image frees the buffer of one that was not finished, but the JPEGIMAGE may never have been cleared:
-// a JPEGIMAGE on the stack, or a JPEGDEC from malloc(), whose constructor did not run. pCoefs is only freed when
-// uCoefsCheck agrees with it, which what is left in memory does not by chance.
-#define JPEG_COEFS_CHECK(p) ((uintptr_t)(p) ^ (uintptr_t)0x4a504547)
 
 // Where the decode of a progressive image is
 enum {
@@ -607,10 +603,10 @@ static const uint16_t usRangeTableB[] = {0x0000,0x0000,0x0000,0x0000,0x0000,0x00
 
 //
 // Memory initialization
+// A JPEGIMAGE need not be cleared before it is opened, so call JPEG_close() before opening another image with it
 //
 int JPEG_openRAM(JPEGIMAGE *pJPEG, uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw)
 {
-    JPEGFreeP(pJPEG); // the coefficients of a progressive image that was not finished
     memset(pJPEG, 0, sizeof(JPEGIMAGE));
     pJPEG->ucMemType = JPEG_MEM_RAM;
     pJPEG->pfnRead = readRAM;
@@ -628,7 +624,6 @@ int JPEG_openRAM(JPEGIMAGE *pJPEG, uint8_t *pData, int iDataSize, JPEG_DRAW_CALL
 //
 int JPEG_openFile(JPEGIMAGE *pJPEG, const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
 {
-    JPEGFreeP(pJPEG); // the coefficients of a progressive image that was not finished
     memset(pJPEG, 0, sizeof(JPEGIMAGE));
     pJPEG->ucMemType = JPEG_MEM_RAM;
     pJPEG->pfnRead = readFile;
@@ -2777,7 +2772,6 @@ static int JPEGAllocCoefsP(JPEGIMAGE *pJPEG, int iBlocks, int iKeep)
     memset(pJPEG->pCoefs, 0, iSize);
     pJPEG->pQuantSaved = &pJPEG->pCoefs[iSize / sizeof(int16_t)];
     pJPEG->ucQuantScanned = pJPEG->ucQuantSaved = 0;
-    pJPEG->uCoefsCheck = JPEG_COEFS_CHECK(pJPEG->pCoefs);
     pJPEG->iCoefKeep = iKeep;
     pJPEG->iCoefStride = iStride;
     return 1;
@@ -2837,14 +2831,13 @@ static int JPEGStartP(JPEGIMAGE *pJPEG)
 } /* JPEGStartP() */
 
 //
-// Free the coefficient buffer, if there is one: the JPEGIMAGE of an open() may hold what was left in memory
+// Free the coefficient buffer, if there is one
 //
 static void JPEGFreeP(JPEGIMAGE *pJPEG)
 {
-    if (pJPEG->pCoefs && pJPEG->uCoefsCheck == JPEG_COEFS_CHECK(pJPEG->pCoefs))
+    if (pJPEG->pCoefs)
         JPEG_FREE(pJPEG->pCoefs);
     pJPEG->pCoefs = NULL;
-    pJPEG->uCoefsCheck = 0;
 } /* JPEGFreeP() */
 //
 // Get a block of a progressive image from the coefficient buffer into the MCU buffer, as JPEGDecodeMCU() leaves

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <type_traits>
 #include <vector>
 
@@ -252,25 +253,24 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
   if (status != 1 || again.geometry != ref.geometry || again.pixels != ref.pixels)
     fail("decode after a refused decodeBegin() differs", 0);
   jpeg.close();
-  // A JPEGDEC from malloc(), as JPEGDisplay makes, whose constructor did not run: open() does not free what is left
-  // in its memory, but does free the buffer of an image that was not finished
+  // A JPEGDEC made in memory of its own, as ESPHome makes it, starts empty whatever that memory held
   for (int fill : {0x00, 0xa5, 0xff}) {
     (*checks)++;
     void *raw = malloc(sizeof(JPEGDEC));
     memset(raw, fill, sizeof(JPEGDEC));
-    auto *heap = static_cast<JPEGDEC *>(raw);
+    auto *heap = new (raw) JPEGDEC();
     Record got;
     if (!heap->open(&mem, size, close_cb, read_cb, seek_cb, draw_cb) || decode_open(*heap, 0, &got) != 1 ||
         got.pixels != ref.pixels || g_buffers != 0)
-      fail("JPEGDEC from malloc() differs", fill);
+      fail("placed JPEGDEC differs", fill);
     heap->open(&mem, size, close_cb, read_cb, seek_cb, draw_cb);
     heap->setUserPointer(&got);
     heap->decodeBegin(0, 0, 0);
     heap->decodeRows(1);
     heap->open(&mem, size, close_cb, read_cb, seek_cb, draw_cb);
     if (g_buffers != 0)
-      fail("JPEGDEC from malloc() kept the buffer", fill);
-    heap->close();
+      fail("placed JPEGDEC kept the buffer", fill);
+    heap->~JPEGDEC();
     free(raw);
   }
   // Color output after a decodeBegin() for grayscale, which keeps no chroma

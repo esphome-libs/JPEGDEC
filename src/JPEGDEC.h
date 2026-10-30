@@ -235,7 +235,6 @@ typedef struct jpeg_image_tag
     int bDecoded; // decodeBegin() succeeded since the image was opened, which uses up its input and tables
     // A progressive image is decoded scan by scan into a buffer of DCT coefficients, then drawn from it
     int16_t *pCoefs; // the first iCoefKeep coefficients of every block in zigzag order, then flags of the rest
-    uintptr_t uCoefsCheck; // JPEG_COEFS_CHECK(pCoefs), which tells a buffer from what is left in memory not cleared
     int iCoefKeep; // coefficients kept per block: 64, 5 at 1/4 scale, or only the DC at 1/8 scale or short of memory
     int iCoefStride; // int16_t per block: iCoefKeep, and 4 more for the nonzero flags of the rest when there are any
     int iCoefOffset[MAX_COMPS_IN_SCAN]; // first block of each component in pCoefs, or -1 when it is not kept
