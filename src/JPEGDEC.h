@@ -217,6 +217,7 @@ typedef struct jpeg_image_tag
     uint8_t iScanStart, iScanEnd, ucFF, ucNumComponents;
     uint8_t ucACTable, ucDCTable;
     uint8_t ucMemType, ucPixelType;
+    uint8_t bOwnsFile; // the file was opened here from its name, rather than given to us already open
     uint16_t u16MCUFlags;
     int iEXIF; // Offset to EXIF 'TIFF' file
     int iError;

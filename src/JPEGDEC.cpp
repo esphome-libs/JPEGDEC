@@ -179,7 +179,8 @@ int JPEGDEC::open(const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
         _jpeg.pfnClose = NULL; // nothing to close
         return 0;
     }
-    return JPEGInit(&_jpeg);
+    _jpeg.bOwnsFile = 1;
+    return JPEGInitOwnedP(&_jpeg);
 } /* open() */
 #endif // __LINUX__
 //
@@ -200,7 +201,8 @@ int JPEGDEC::open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOS
        _jpeg.pfnClose = NULL; // nothing to close
        return 0;
     }
-    return JPEGInit(&_jpeg);
+    _jpeg.bOwnsFile = 1;
+    return JPEGInitOwnedP(&_jpeg);
 
 } /* open() */
 

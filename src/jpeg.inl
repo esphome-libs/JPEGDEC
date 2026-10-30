@@ -78,6 +78,7 @@ static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable);
 static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG, int iTables);
 static void JPEGFreeP(JPEGIMAGE *pJPEG);
 static void JPEGCloseFileP(JPEGIMAGE *pJPEG);
+static int JPEGInitOwnedP(JPEGIMAGE *pJPEG);
 
 // The coefficient buffer of a progressive image is allocated with these; define them to use another allocator.
 // On ESP32 it goes in PSRAM when there is PSRAM with room for it, and in internal RAM otherwise, but only while
@@ -642,7 +643,8 @@ int JPEG_openFile(JPEGIMAGE *pJPEG, const char *szFilename, JPEG_DRAW_CALLBACK *
     fseek((FILE *)pJPEG->JPEGFile.fHandle, 0, SEEK_END);
     pJPEG->JPEGFile.iSize = (int)ftell((FILE *)pJPEG->JPEGFile.fHandle);
     fseek((FILE *)pJPEG->JPEGFile.fHandle, 0, SEEK_SET);
-    return JPEGInit(pJPEG);
+    pJPEG->bOwnsFile = 1;
+    return JPEGInitOwnedP(pJPEG);
 } /* JPEG_openFile() */
 
 int JPEG_getLastError(JPEGIMAGE *pJPEG)
@@ -2920,6 +2922,17 @@ static void JPEGCloseFileP(JPEGIMAGE *pJPEG)
         (*pJPEG->pfnClose)(pJPEG->JPEGFile.fHandle);
     pJPEG->pfnClose = NULL;
 } /* JPEGCloseFileP() */
+//
+// Initialize an image from a file opened here from its name, which is closed if that fails, as the caller has no
+// way to know that it needs closing. Returns 1 for success, 0 for failure.
+//
+static int JPEGInitOwnedP(JPEGIMAGE *pJPEG)
+{
+    if (JPEGInit(pJPEG))
+        return 1;
+    JPEGCloseFileP(pJPEG);
+    return 0;
+} /* JPEGInitOwnedP() */
 //
 // Get a block of a progressive image from the coefficient buffer into the MCU buffer, as JPEGDecodeMCU() leaves
 // a block that it decodes. iBlock is the block's place in MCU (x, y).
