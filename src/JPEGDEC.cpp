@@ -175,7 +175,10 @@ int JPEGDEC::open(const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
     _jpeg.pfnDraw = pfnDraw;
     _jpeg.iMaxMCUs = 1000;
     _jpeg.JPEGFile.fHandle = openFile(szFilename, &_jpeg.JPEGFile.iSize);
-    if (_jpeg.JPEGFile.fHandle == NULL) return 0;
+    if (_jpeg.JPEGFile.fHandle == NULL) {
+        _jpeg.pfnClose = NULL; // nothing to close
+        return 0;
+    }
     return JPEGInit(&_jpeg);
 } /* open() */
 #endif // __LINUX__
@@ -193,8 +196,10 @@ int JPEGDEC::open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOS
     _jpeg.pfnClose = pfnClose;
     _jpeg.iMaxMCUs = 1000; // set to an unnaturally high value to start
     _jpeg.JPEGFile.fHandle = (*pfnOpen)(szFilename, &_jpeg.JPEGFile.iSize);
-    if (_jpeg.JPEGFile.fHandle == NULL)
+    if (_jpeg.JPEGFile.fHandle == NULL) {
+       _jpeg.pfnClose = NULL; // nothing to close
        return 0;
+    }
     return JPEGInit(&_jpeg);
 
 } /* open() */
@@ -250,8 +255,7 @@ void JPEGDEC::close()
 {
     _jpeg.bDecodeActive = 0;
     JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
-    if (_jpeg.pfnClose)
-        (*_jpeg.pfnClose)(_jpeg.JPEGFile.fHandle);
+    JPEGCloseFileP(&_jpeg);
 } /* close() */
 
 //

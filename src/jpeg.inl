@@ -77,6 +77,7 @@ static void JPEGDither(JPEGIMAGE *pJPEG, int iWidth, int iHeight);
 static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable);
 static int JPEGMakeHuffTablesP(JPEGIMAGE *pJPEG, int iTables);
 static void JPEGFreeP(JPEGIMAGE *pJPEG);
+static void JPEGCloseFileP(JPEGIMAGE *pJPEG);
 
 // The coefficient buffer of a progressive image is allocated with these; define them to use another allocator.
 // On ESP32 it goes in PSRAM when there is PSRAM with room for it, and in internal RAM otherwise, but only while
@@ -634,7 +635,10 @@ int JPEG_openFile(JPEGIMAGE *pJPEG, const char *szFilename, JPEG_DRAW_CALLBACK *
     pJPEG->iMaxMCUs = 1000; // set to an unnaturally high value to start
     pJPEG->JPEGFile.fHandle = fopen(szFilename, "r+b");
     if (pJPEG->JPEGFile.fHandle == NULL)
+    {
+       pJPEG->pfnClose = NULL; // nothing to close
        return 0;
+    }
     fseek((FILE *)pJPEG->JPEGFile.fHandle, 0, SEEK_END);
     pJPEG->JPEGFile.iSize = (int)ftell((FILE *)pJPEG->JPEGFile.fHandle);
     fseek((FILE *)pJPEG->JPEGFile.fHandle, 0, SEEK_SET);
@@ -728,8 +732,7 @@ void JPEG_close(JPEGIMAGE *pJPEG)
 {
     pJPEG->bDecodeActive = 0;
     JPEGFreeP(pJPEG);
-    if (pJPEG->pfnClose)
-        (*pJPEG->pfnClose)(pJPEG->JPEGFile.fHandle);
+    JPEGCloseFileP(pJPEG);
 } /* JPEG_close() */
 
 #endif // !__cplusplus
@@ -2908,6 +2911,15 @@ static void JPEGFreeP(JPEGIMAGE *pJPEG)
         JPEG_FREE(pJPEG->pHuffExtra);
     pJPEG->pHuffExtra = NULL;
 } /* JPEGFreeP() */
+//
+// Close the file, once however many times it is called
+//
+static void JPEGCloseFileP(JPEGIMAGE *pJPEG)
+{
+    if (pJPEG->pfnClose)
+        (*pJPEG->pfnClose)(pJPEG->JPEGFile.fHandle);
+    pJPEG->pfnClose = NULL;
+} /* JPEGCloseFileP() */
 //
 // Get a block of a progressive image from the coefficient buffer into the MCU buffer, as JPEGDecodeMCU() leaves
 // a block that it decodes. iBlock is the block's place in MCU (x, y).

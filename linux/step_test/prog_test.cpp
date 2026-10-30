@@ -552,6 +552,63 @@ static int scan_cut_by_marker_checks(const std::vector<uint8_t> &prog, const cha
   return failures;
 }
 
+// Files opened through callbacks, each with a handle that is live until it is closed
+static int g_files_open = 0, g_files_closed_twice = 0;
+static std::vector<uint8_t> g_file_data;
+struct CountedFile {
+  bool open;
+};
+static void *open_file_cb(const char *name, int32_t *size) {
+  if (name[0] == 'n')
+    return nullptr;
+  g_files_open++;
+  *size = static_cast<int32_t>(g_file_data.size());
+  return new CountedFile{true};
+}
+static void close_file_cb(void *handle) {
+  auto *file = static_cast<CountedFile *>(handle);
+  if (file == nullptr || !file->open) {
+    g_files_closed_twice++;
+    return;
+  }
+  file->open = false;
+  g_files_open--;
+}
+static int32_t read_file_cb(JPEGFILE *f, uint8_t *buf, int32_t len) {
+  const int32_t n = std::max<int32_t>(0, std::min<int32_t>(len, static_cast<int32_t>(g_file_data.size()) - f->iPos));
+  memcpy(buf, g_file_data.data() + f->iPos, n);
+  f->iPos += n;
+  return n;
+}
+
+// close() can be called any number of times, also after an open() that found no file
+static int file_handle_checks(const std::vector<uint8_t> &prog, const char *name, int *checks) {
+  int failures = 0;
+  const auto check = [&](bool good, const char *what) {
+    (*checks)++;
+    if (!good || g_files_closed_twice != 0) {
+      printf("FAIL %s: %s (%d open, %d closed twice)\n", name, what, g_files_open, g_files_closed_twice);
+      failures++;
+    }
+    g_files_open = g_files_closed_twice = 0;
+  };
+  g_file_data = prog;
+  {
+    JPEGDEC jpeg;
+    jpeg.open("file", open_file_cb, close_file_cb, read_file_cb, seek_cb, draw_cb);
+    jpeg.close();
+    jpeg.close();
+    check(g_files_open == 0, "close() twice");
+  }
+  {
+    JPEGDEC jpeg;
+    jpeg.open("none", open_file_cb, close_file_cb, read_file_cb, seek_cb, draw_cb);
+    jpeg.close();
+    check(g_files_open == 0, "close() with no file");
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -641,6 +698,7 @@ int main(int argc, char **argv) {
       continue;
     }
     failures += edge_checks(prog, prog_name, &checks);
+    failures += file_handle_checks(prog, prog_name, &checks);
     if (prog.size() > 2048)
       failures += scan_cut_by_marker_checks(prog, prog_name, configs[0], &checks);
     if (strstr(prog_name, "scans_spectral") != nullptr)
