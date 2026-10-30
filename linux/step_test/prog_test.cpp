@@ -320,6 +320,48 @@ static int sof1_checks(const std::vector<uint8_t> &sof1, const char *name, int *
   return failures;
 }
 
+// The offset of the next FF marker at or after from, or 0. Only for markers before the data of the first scan.
+static size_t find_marker(const std::vector<uint8_t> &f, uint8_t marker, size_t from = 2) {
+  for (size_t i = from; i + 1 < f.size(); i++) {
+    if (f[i] == 0xff && f[i + 1] == marker)
+      return i;
+    if (f[i] == 0xff && f[i + 1] == 0xda)
+      return 0;
+    if (f[i] == 0xff && f[i + 1] >= 0xc0 && f[i + 1] != 0xff) { // over the segment, whose bytes can look like a marker
+      i += 1 + ((f[i + 2] << 8) | f[i + 3]);
+    }
+  }
+  return 0;
+}
+
+// A copy of the file whose quantization tables have 2 added to their numbers, in the DQT and SOF segments
+static std::vector<uint8_t> renumber_quant(std::vector<uint8_t> f) {
+  for (size_t i = find_marker(f, 0xdb); i != 0; i = find_marker(f, 0xdb, i + 2)) {
+    const size_t end = i + 2 + ((f[i + 2] << 8) | f[i + 3]);
+    for (size_t j = i + 4; j < end; j += 1 + ((f[j] >> 4) ? 128 : 64))
+      f[j] += 2;
+  }
+  for (uint8_t sof : {0xc0, 0xc1, 0xc2}) {
+    const size_t i = find_marker(f, sof);
+    if (i != 0) {
+      for (int comp = 0; comp < f[i + 9]; comp++)
+        f[i + 12 + 3 * comp] += 2;
+    }
+  }
+  return f;
+}
+
+// Whatever numbers the file gives its quantization tables, it decodes the same
+static int quant_number_checks(const std::vector<uint8_t> &file, const char *name, const Config &c, int *checks) {
+  (*checks)++;
+  const Result ref = run(file, c, 0, 0), got = run(renumber_quant(file), c, 0, 0);
+  if (got.status != ref.status || got.record.pixels != ref.record.pixels) {
+    printf("FAIL %s: other quantization table numbers differ (status %d/%d error %d)\n", name, got.status, ref.status, got.error);
+    return 1;
+  }
+  return 0;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -393,6 +435,8 @@ int main(int argc, char **argv) {
         }
       }
     }
+    failures += quant_number_checks(base, base_name, configs[0], &checks);
+    failures += quant_number_checks(prog, prog_name, configs[0], &checks);
     JPEGDEC probe;
     probe.openRAM(const_cast<uint8_t *>(prog.data()), static_cast<int>(prog.size()), draw_cb);
     if (probe.getJPEGType() != JPEG_MODE_PROGRESSIVE) {

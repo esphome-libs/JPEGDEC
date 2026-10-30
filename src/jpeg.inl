@@ -1940,10 +1940,18 @@ static void JPEGFixQuantTable(JPEGIMAGE *pJPEG, int iTable)
 
 static void JPEGFixQuantD(JPEGIMAGE *pJPEG)
 {
-    int iTable;
-    
-    for (iTable=0; iTable<pJPEG->ucNumComponents; iTable++)
-        JPEGFixQuantTable(pJPEG, iTable);
+    int i, iTable;
+    uint8_t ucFixed = 0;
+
+    for (i=0; i<pJPEG->ucNumComponents; i++) // the tables the components use, once each however many share one
+    {
+        iTable = pJPEG->JPCI[i].quant_tbl_no;
+        if (!(ucFixed & (1 << iTable)))
+        {
+            JPEGFixQuantTable(pJPEG, iTable);
+            ucFixed |= (uint8_t)(1 << iTable);
+        }
+    }
 } /* JPEGFixQuantD() */
 //
 // Progressive JPEG
