@@ -58,7 +58,7 @@
 #define JPEG_FILE_BUF_SIZE 2048
 #define HUFF_TABLEN  273
 #define HUFF11SIZE (1<<11)
-#define AC_TABLES 3 // a scan has up to 3 components, and each can have its own AC table
+#define HUFF_TABLES 3 // a scan has up to 3 components, and each can have its own tables; rarely more than 2 of them
 #define DC_TABLE_SIZE 768 // codes up to 255, then the precalculated extra bits of the short ones at 512
 #define DCTSIZE 64
 #define MAX_MCU_COUNT 6
@@ -267,8 +267,10 @@ typedef struct jpeg_image_tag
     void *pFramebuffer;
     int16_t sQuantTable[DCTSIZE*4]; // quantization tables
     uint8_t ucFileBuf[JPEG_FILE_BUF_SIZE]; // holds temp data and pixel stack
-    uint8_t ucHuffDC[DC_TABLE_SIZE * 4]; // up to 4 'short' tables, as extended sequential images can have
-    uint16_t usHuffAC[HUFF11SIZE * AC_TABLES]; // the AC tables the scan uses, whatever their numbers
+    uint8_t ucHuffDC[DC_TABLE_SIZE * 2]; // the first 2 DC tables the scan uses, whatever their numbers
+    uint16_t usHuffAC[HUFF11SIZE * 2]; // the first 2 AC tables the scan uses, whatever their numbers
+    uint8_t *pHuffExtra; // a third DC and AC table, which only an extended sequential image can need, when it does
+    uint8_t ucDCSlot[4], ucACSlot[4]; // where each table number goes, 0xff when the scan doesn't use it
 } JPEGIMAGE;
 
 #ifdef __cplusplus

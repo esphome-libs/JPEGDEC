@@ -1121,10 +1121,23 @@ static int JPEGMakeHuffTables_Slow(JPEGIMAGE *pJPEG, int bThumbnail)
 } /* JPEGMakeHuffTables_Slow() */
 #endif // FUTURE
 //
-// Expand the Huffman tables for fast decoding
+// A table of a slot: the first 2 are in the JPEGIMAGE, and the third in pHuffExtra
+//
+#define JPEG_HUFF_EXTRA_SIZE (DC_TABLE_SIZE + HUFF11SIZE * sizeof(uint16_t))
+static inline uint8_t *JPEGHuffDC(JPEGIMAGE *pJPEG, int iSlot)
+{
+    return (iSlot < 2) ? &pJPEG->ucHuffDC[iSlot * DC_TABLE_SIZE] : pJPEG->pHuffExtra;
+} /* JPEGHuffDC() */
+
+static inline uint16_t *JPEGHuffAC(JPEGIMAGE *pJPEG, int iSlot)
+{
+    return (iSlot < 2) ? &pJPEG->usHuffAC[iSlot * HUFF11SIZE] : (uint16_t *)&pJPEG->pHuffExtra[DC_TABLE_SIZE];
+} /* JPEGHuffAC() */
+//
+// Expand the tables with a slot, those in pHuffExtra with bExtra and otherwise the rest
 // returns 1 for success, 0 for failure
 //
-static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
+static int JPEGBuildHuffTables(JPEGIMAGE *pJPEG, int bThumbnail, int bExtra)
 {
     int code, repeat, count, codestart;
     int j;
@@ -1136,30 +1149,9 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     int cc; // code
     uint8_t *p, *pBits, ucCode;
     int iMaxLength, iMaxMask;
-    int iTablesUsed, iSlots;
-    uint8_t ucACSlot[4]; // where each AC table goes in usHuffAC, 0xff when the scan doesn't use it
-    
-    if (pJPEG->ucMode == 0xc2) // progressive images have their own tables
-        return JPEGMakeHuffTablesP(pJPEG, pJPEG->ucHuffTableUsed);
-    // There is room for AC_TABLES AC tables. Each table the scan uses gets the next one and its components are
-    // pointed at it, so a table can have any number from 0 to 3, and one that is defined but not used takes no room
-    memset(ucACSlot, 0xff, sizeof(ucACSlot));
-    iSlots = 0;
-    for (j=0; j<pJPEG->ucNumComponents; j++)
-    {
-        if (!pJPEG->JPCI[j].component_needed)
-            continue;
-        iTable = pJPEG->JPCI[j].ac_tbl_no;
-        if (!(pJPEG->ucHuffTableUsed & (1 << (iTable+4))))
-            return 0; // not defined
-        if (ucACSlot[iTable] == 0xff)
-        {
-            if (iSlots == AC_TABLES)
-                return 0;
-            ucACSlot[iTable] = (uint8_t)iSlots++;
-        }
-        pJPEG->JPCI[j].ac_tbl_no = ucACSlot[iTable];
-    }
+    int iTablesUsed;
+    uint8_t *ucACSlot = pJPEG->ucACSlot;
+
     iTablesUsed = 0;
     pHuffVals = (uint8_t *)pJPEG->usPixels;
     for (j=0; j<4; j++)
@@ -1175,12 +1167,12 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     iMaxMask = 0x7f; // lower 7 bits after truncate 5 leading 1's
     for (iTable = 0; iTable < 4; iTable++)
     {
-        if (pJPEG->ucHuffTableUsed & (1 << iTable))
+        if (pJPEG->ucDCSlot[iTable] != 0xff && (pJPEG->ucDCSlot[iTable] == 2) == bExtra) // the scan uses this table
         {
             //         pJPEG->huffdcFast[iTable] = (int *)PILIOAlloc(0x180); // short table = 128 bytes, long table = 256 bytes
-            pucShort = &pJPEG->ucHuffDC[iTable*DC_TABLE_SIZE];
+            pucShort = JPEGHuffDC(pJPEG, pJPEG->ucDCSlot[iTable]);
             //         pJPEG->huffdc[iTable] = pJPEG->huffdcFast[iTable] + 0x20; // 0x20 longs = 128 bytes
-            pucLong = &pJPEG->ucHuffDC[iTable*DC_TABLE_SIZE + 128];
+            pucLong = pucShort + 128;
             pBits = &pHuffVals[iTable * HUFF_TABLEN];
             p = pBits;
             p += 16; // point to bit data
@@ -1263,13 +1255,13 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
     // We split the codes into a short table (9 bits or less) and a long table (first 5 bits are 1)
     for (iTable = 0; iTable < 4; iTable++)
     {
-        if (ucACSlot[iTable] != 0xff)  // if the scan uses this table, which is then defined
+        if (ucACSlot[iTable] != 0xff && (ucACSlot[iTable] == 2) == bExtra)  // if the scan uses this table, which is then defined
         {
             pBits = &pHuffVals[(iTable+4) * HUFF_TABLEN];
             p = pBits;
             p += 16; // point to bit data
-            pShort = &pJPEG->usHuffAC[ucACSlot[iTable]*HUFF11SIZE];
-            pLong = &pJPEG->usHuffAC[ucACSlot[iTable]*HUFF11SIZE + 1024];
+            pShort = JPEGHuffAC(pJPEG, ucACSlot[iTable]);
+            pLong = pShort + 1024;
             cc = 0; // start with a code of 0
             // construct the decode table
             for (iBitNum = 1; iBitNum <= 16; iBitNum++)
@@ -1352,7 +1344,81 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
         } // if table defined
     }
     return 1;
+} /* JPEGBuildHuffTables() */
+//
+// Give each table the scan uses the next slot, and point its components at it, so a table can have any number from
+// 0 to 3, and one that is defined but not used takes no room. Then expand the tables for fast decoding. A third
+// table has no room here: JPEGMakeExtraHuffTables() makes it when the image is decoded, as it needs memory that only
+// an image being decoded is sure to give back.
+// returns 1 for success, 0 for failure
+//
+static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
+{
+    int j, iTable, iSlotsDC = 0, iSlotsAC = 0;
+
+    if (pJPEG->ucMode == 0xc2) // progressive images have their own tables
+        return JPEGMakeHuffTablesP(pJPEG, pJPEG->ucHuffTableUsed);
+    memset(pJPEG->ucDCSlot, 0xff, sizeof(pJPEG->ucDCSlot));
+    memset(pJPEG->ucACSlot, 0xff, sizeof(pJPEG->ucACSlot));
+    for (j=0; j<pJPEG->ucNumComponents; j++)
+    {
+        if (!pJPEG->JPCI[j].component_needed)
+            continue;
+        iTable = pJPEG->JPCI[j].dc_tbl_no;
+        if (!(pJPEG->ucHuffTableUsed & (1 << iTable)))
+            return 0; // not defined
+        if (pJPEG->ucDCSlot[iTable] == 0xff)
+        {
+            if (iSlotsDC == HUFF_TABLES)
+                return 0;
+            pJPEG->ucDCSlot[iTable] = (uint8_t)iSlotsDC++;
+        }
+        pJPEG->JPCI[j].dc_tbl_no = pJPEG->ucDCSlot[iTable];
+        iTable = pJPEG->JPCI[j].ac_tbl_no;
+        if (!(pJPEG->ucHuffTableUsed & (1 << (iTable+4))))
+            return 0; // not defined
+        if (pJPEG->ucACSlot[iTable] == 0xff)
+        {
+            if (iSlotsAC == HUFF_TABLES)
+                return 0;
+            pJPEG->ucACSlot[iTable] = (uint8_t)iSlotsAC++;
+        }
+        pJPEG->JPCI[j].ac_tbl_no = pJPEG->ucACSlot[iTable];
+    }
+    return JPEGBuildHuffTables(pJPEG, bThumbnail, 0);
 } /* JPEGMakeHuffTables() */
+//
+// Make a third DC or AC table if the image has one, from the values JPEGGetHuffTables() left in usPixels, where
+// they stay until something is drawn. Returns 1 for success, 0 for failure.
+//
+static int JPEGMakeExtraHuffTables(JPEGIMAGE *pJPEG)
+{
+    int i, bExtra = 0;
+
+    if (pJPEG->ucMode == 0xc2 || pJPEG->pHuffExtra)
+        return 1;
+    for (i=0; i<4; i++)
+    {
+        if (pJPEG->ucDCSlot[i] == 2 || pJPEG->ucACSlot[i] == 2)
+            bExtra = 1;
+    }
+    if (!bExtra)
+        return 1;
+    pJPEG->pHuffExtra = (uint8_t *)JPEG_MALLOC(JPEG_HUFF_EXTRA_SIZE);
+    if (pJPEG->pHuffExtra == NULL)
+    {
+        pJPEG->iError = JPEG_ERROR_MEMORY;
+        return 0;
+    }
+    memset(pJPEG->pHuffExtra, 0, JPEG_HUFF_EXTRA_SIZE);
+    if (!JPEGBuildHuffTables(pJPEG, 0, 1))
+    {
+        JPEGFreeP(pJPEG);
+        pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+        return 0;
+    }
+    return 1;
+} /* JPEGMakeExtraHuffTables() */
 
 //
 // TIFFSHORT
@@ -2831,13 +2897,16 @@ static int JPEGStartP(JPEGIMAGE *pJPEG)
 } /* JPEGStartP() */
 
 //
-// Free the coefficient buffer, if there is one
+// Free what an image being decoded allocated: its coefficient buffer, and a third Huffman table
 //
 static void JPEGFreeP(JPEGIMAGE *pJPEG)
 {
     if (pJPEG->pCoefs)
         JPEG_FREE(pJPEG->pCoefs);
     pJPEG->pCoefs = NULL;
+    if (pJPEG->pHuffExtra)
+        JPEG_FREE(pJPEG->pHuffExtra);
+    pJPEG->pHuffExtra = NULL;
 } /* JPEGFreeP() */
 //
 // Get a block of a progressive image from the coefficient buffer into the MCU buffer, as JPEGDecodeMCU() leaves
@@ -2923,7 +2992,7 @@ static int JPEGDecodeMCU(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
     pEnd = (unsigned char *)&cZigZag2[64];
 
     // get the DC component
-    pucFast = &pJPEG->ucHuffDC[pJPEG->ucDCTable * DC_TABLE_SIZE];
+    pucFast = JPEGHuffDC(pJPEG, pJPEG->ucDCTable);
     ulCode = (ulBits >> (REGISTER_WIDTH - 12 - ulBitOff)) & 0xfff; // get as lower 12 bits
     if (ulCode >= 0xf80) // it's a long code
         ulCode = (ulCode & 0xff); // point to long table and trim to 7-bits + 0x80 offset into long table
@@ -2960,13 +3029,13 @@ static int JPEGDecodeMCU(JPEGIMAGE *pJPEG, int iMCU, int *iDCPredictor)
     if (iMCU >= 0) { // non-skipped block
         pMCU[0] = (short)*iDCPredictor; // store in MCU[0]
     }
-    if (pJPEG->ucACTable >= AC_TABLES) // unsupported
+    if (pJPEG->ucACTable >= HUFF_TABLES) // unsupported
         return -1;
     if (pJPEG->iScanEnd == 0) { // first scan of progressive has only DC values
         return 0; // we're done
     }
     // Now get the other 63 AC coefficients
-    pFast = &pJPEG->usHuffAC[pJPEG->ucACTable * HUFF11SIZE];
+    pFast = JPEGHuffAC(pJPEG, pJPEG->ucACTable);
     if (pJPEG->b11Bit) // 11-bit "slow" tables used
     {
 //            if (pJPEG->pHuffACFast == pJPEG->huffacFast[1]) // second table
@@ -5856,6 +5925,8 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
     pJPEG->iDMAOffset = 0;
     pJPEG->pAlignedPixels = pJPEG->usPixels;
     if (pJPEG->ucMode == 0xc2 && !JPEGStartP(pJPEG)) // progressive: the scans are decoded before drawing
+        return 0;
+    if (!JPEGMakeExtraHuffTables(pJPEG))
         return 0;
     // reorder and fix the quantization table for decoding; last, so that a decodeBegin() that failed can be retried
     JPEGFixQuantD(pJPEG);

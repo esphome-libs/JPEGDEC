@@ -317,6 +317,32 @@ static int edge_checks(const std::vector<uint8_t> &prog, const char *name, int *
 // An extended sequential file with 12 bits per sample, or a scan that uses an AC table past 1, is refused
 static int sof1_checks(const std::vector<uint8_t> &sof1, const char *name, int *checks) {
   int failures = 0;
+  // Its third table is allocated only while it is decoded. It can run out of memory, and be retried.
+  (*checks)++;
+  JPEGDEC extra;
+  Record got;
+  int status;
+  if (!extra.openRAM(const_cast<uint8_t *>(sof1.data()), static_cast<int>(sof1.size()), draw_cb) || g_buffers != 0) {
+    printf("FAIL %s: memory allocated by open()\n", name);
+    failures++;
+  }
+  extra.setUserPointer(&got);
+  g_fail_allocs = 1;
+  if (extra.decodeBegin(0, 0, 0) || extra.getLastError() != JPEG_ERROR_MEMORY || g_buffers != 0) {
+    printf("FAIL %s: no JPEG_ERROR_MEMORY for the third table\n", name);
+    failures++;
+  }
+  g_fail_allocs = 0;
+  if (!extra.decodeBegin(0, 0, 0) || g_buffers != 1) {
+    printf("FAIL %s: no third table after a retry\n", name);
+    failures++;
+  }
+  while ((status = extra.decodeRows(1000)) == JPEG_DECODE_MORE) {
+  }
+  if (status != 1 || g_buffers != 0) {
+    printf("FAIL %s: third table status %d, %d buffers left\n", name, status, g_buffers);
+    failures++;
+  }
   for (int what = 0; what < 2; what++) {
     (*checks)++;
     std::vector<uint8_t> bad = sof1;
