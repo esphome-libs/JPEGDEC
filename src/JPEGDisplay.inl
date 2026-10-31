@@ -19,6 +19,7 @@
 #ifndef __JPEGDISPLAY_IMPL__
 #define __JPEGDISPLAY_IMPL__
 #include "JPEGDisplay.h"
+#include <new>
 
 static int JPEGDraw(JPEGDRAW *pDraw)
 {
@@ -52,11 +53,14 @@ static void jpegClose(void *handle) {
 static int32_t jpegRead(JPEGFILE *handle, uint8_t *buffer, int32_t length) {
   File *pFile = (File *)handle->fHandle;
   if (!pFile) return 0;
-  return pFile->read(buffer, length);
+  int32_t iBytesRead = pFile->read(buffer, length);
+  if (iBytesRead > 0) handle->iPos += iBytesRead; // the decoder compares iPos with iSize to see where the input ends
+  return iBytesRead;
 }
 static int32_t jpegSeek(JPEGFILE *handle, int32_t position) {
   File *pFile = (File *)handle->fHandle;
   if (!pFile) return 0;
+  handle->iPos = position;
   return pFile->seek(position);
 }
 
@@ -65,7 +69,7 @@ int JPEGDisplay::loadJPEG(BB_SPI_LCD *pLCD, int x, int y, const void *pData, int
 JPEGDEC *jpeg;
 int w, h, rc;
 
-    jpeg = (JPEGDEC *)malloc(sizeof(JPEGDEC));
+    jpeg = new (std::nothrow) JPEGDEC;
     if (!jpeg) {
         _iLastError = JPEG_ERROR_MEMORY;
         return 0;
@@ -79,7 +83,7 @@ int w, h, rc;
             if (x < 0) x = 0;
         } else if (x < 0 || w + x > pLCD->width()) {
             _iLastError = JPEG_INVALID_PARAMETER;
-            free(jpeg);
+            delete jpeg;
             return 0; // clipping not supported
         }
         if (y == JPEGDISPLAY_CENTER) {
@@ -88,18 +92,18 @@ int w, h, rc;
         } else if (y < 0 || y + h > pLCD->height()) {
         // clipping is not supported
             _iLastError = JPEG_INVALID_PARAMETER;
-            free(jpeg);
+            delete jpeg;
             return 0;
         }
         jpeg->setUserPointer((void *)pLCD);
         jpeg->decode(x, y, iOptions); // perform decoding
         jpeg->close();
-        free(jpeg);
+        delete jpeg;
         _iLastError = JPEG_SUCCESS;
         return 1;
    }
    _iLastError = jpeg->getLastError();
-   free(jpeg);
+   delete jpeg;
    return 0;
 } /* loadJPEG() */
 
@@ -108,7 +112,7 @@ int JPEGDisplay::loadJPEG(BB_SPI_LCD *pLCD, int x, int y, const char *fname, int
     JPEGDEC *jpeg;
     int w, h, rc;
 
-    jpeg = (JPEGDEC *)malloc(sizeof(JPEGDEC));
+    jpeg = new (std::nothrow) JPEGDEC;
     if (!jpeg) {
         _iLastError = JPEG_ERROR_MEMORY;
         return 0;
@@ -122,7 +126,7 @@ int JPEGDisplay::loadJPEG(BB_SPI_LCD *pLCD, int x, int y, const char *fname, int
             if (x < 0) x = 0;
         } else if (x < 0 || w + x > pLCD->width()) {
             _iLastError = JPEG_INVALID_PARAMETER;
-            free(jpeg);
+            delete jpeg;
             return 0; // clipping not supported
         }
         if (y == JPEGDISPLAY_CENTER) {
@@ -131,18 +135,18 @@ int JPEGDisplay::loadJPEG(BB_SPI_LCD *pLCD, int x, int y, const char *fname, int
         } else if (y < 0 || y + h > pLCD->height()) {
         // clipping is not supported
             _iLastError = JPEG_INVALID_PARAMETER;
-            free(jpeg);
+            delete jpeg;
             return 0;
         }
         jpeg->setUserPointer((void *)pLCD);
         jpeg->decode(x, y, iOptions); // decode the image
         jpeg->close();
-        free(jpeg);
+        delete jpeg;
         _iLastError = JPEG_SUCCESS;
         return 1;
     }
     _iLastError = jpeg->getLastError();
-    free(jpeg);
+    delete jpeg;
     return 0;
 } /* loadJPEG() */
 
@@ -154,7 +158,7 @@ int JPEGDisplay::loadJPEG_LFS(BB_SPI_LCD *pLCD, int x, int y, const char *fname,
     if (!LittleFS.begin(false)) {
         return 0;
     }
-    jpeg = (JPEGDEC *)malloc(sizeof(JPEGDEC));
+    jpeg = new (std::nothrow) JPEGDEC;
     if (!jpeg) {
         _iLastError = JPEG_ERROR_MEMORY;
         return 0;
@@ -168,7 +172,7 @@ int JPEGDisplay::loadJPEG_LFS(BB_SPI_LCD *pLCD, int x, int y, const char *fname,
             if (x < 0) x = 0;
         } else if (x < 0 || w + x > pLCD->width()) {
             jpeg->close();
-            free(jpeg);
+            delete jpeg;
             _iLastError = JPEG_INVALID_PARAMETER;
             return 0; // clipping not supported
         }
@@ -178,7 +182,7 @@ int JPEGDisplay::loadJPEG_LFS(BB_SPI_LCD *pLCD, int x, int y, const char *fname,
         } else if (y < 0 || y + h > pLCD->height()) {
         // clipping is not supported
             jpeg->close();
-            free(jpeg);
+            delete jpeg;
             _iLastError = JPEG_INVALID_PARAMETER;
             return 0;
         }
@@ -186,13 +190,13 @@ int JPEGDisplay::loadJPEG_LFS(BB_SPI_LCD *pLCD, int x, int y, const char *fname,
         jpeg->decode(x, y, iOptions); // decode the image
         jpeg->close();
         _iLastError = JPEG_SUCCESS;
-        free(jpeg);
+        delete jpeg;
         return 1;
     } else {
 //        Serial.printf("jpeg->open failed with code: %d\n", jpeg->getLastError());
     }
     _iLastError = jpeg->getLastError();
-    free(jpeg);
+    delete jpeg;
     return 0;
 } /* loadJPEG_LFS() */
 
@@ -203,7 +207,7 @@ int JPEGDisplay::getJPEGInfo(int *width, int *height, int *bpp, const void *pDat
 
     if (!width || !height || !bpp || !pData || iDataSize < 32) return 0;
     
-    jpeg = (JPEGDEC *)malloc(sizeof(JPEGDEC));
+    jpeg = new (std::nothrow) JPEGDEC;
     if (!jpeg) {
         _iLastError = JPEG_ERROR_MEMORY;
         return 0;
@@ -212,12 +216,12 @@ int JPEGDisplay::getJPEGInfo(int *width, int *height, int *bpp, const void *pDat
         *width = jpeg->getWidth();
         *height = jpeg->getHeight();
         *bpp = jpeg->getBpp();
-        free(jpeg);
+        delete jpeg;
         _iLastError = JPEG_SUCCESS;
         return 1;
     }
     _iLastError = jpeg->getLastError();
-    free(jpeg);
+    delete jpeg;
     return 0;
 } /* getJPEGInfo() */
 
@@ -227,7 +231,7 @@ int JPEGDisplay::getJPEGInfo(int *width, int *height, int *bpp, const char *fnam
     int rc;
 
     if (!width || !height || !bpp || !fname) return 0;
-    jpeg = (JPEGDEC *)malloc(sizeof(JPEGDEC));
+    jpeg = new (std::nothrow) JPEGDEC;
     if (!jpeg) {
         _iLastError = JPEG_ERROR_MEMORY;
         return 0;
@@ -237,12 +241,12 @@ int JPEGDisplay::getJPEGInfo(int *width, int *height, int *bpp, const char *fnam
         *height = jpeg->getHeight();
         *bpp = jpeg->getBpp();
         jpeg->close();
-        free(jpeg);
+        delete jpeg;
         _iLastError = JPEG_SUCCESS;
         return 1;
     }
     _iLastError = jpeg->getLastError();
-    free(jpeg);
+    delete jpeg;
     return 0;
 } /* getJPEGInfo() */
 
@@ -255,7 +259,7 @@ int JPEGDisplay::getJPEGInfo_LFS(int *width, int *height, int *bpp, const char *
         return 0;
     }
     if (!width || !height || !bpp || !fname) return 0;
-    jpeg = (JPEGDEC *)malloc(sizeof(JPEGDEC));
+    jpeg = new (std::nothrow) JPEGDEC;
     if (!jpeg) {
         _iLastError = JPEG_ERROR_MEMORY;
         return 0;
@@ -265,12 +269,12 @@ int JPEGDisplay::getJPEGInfo_LFS(int *width, int *height, int *bpp, const char *
         *height = jpeg->getHeight();
         *bpp = jpeg->getBpp();
         jpeg->close();
-        free(jpeg);
+        delete jpeg;
         _iLastError = JPEG_SUCCESS;
         return 1;
     }
     _iLastError = jpeg->getLastError();
-    free(jpeg);
+    delete jpeg;
     return 0;
 } /* getJPEGInfo_LFS() */
 

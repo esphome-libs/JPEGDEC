@@ -3,3 +3,4 @@ step_test_asan
 images/
 crop_test
 crop_test_asan
+prog_test

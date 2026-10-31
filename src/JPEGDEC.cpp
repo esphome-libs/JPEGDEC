@@ -35,6 +35,19 @@ void JPEG_setFramebuffer(JPEGIMAGE *pJPEG, void *pFramebuffer);
 // Include the C code which does the actual work
 #include "jpeg.inl"
 
+// Starts empty, so that the first open() has no coefficient buffer to free
+JPEGDEC::JPEGDEC()
+{
+    memset(&_jpeg, 0, sizeof(JPEGIMAGE));
+} /* JPEGDEC() */
+
+JPEGDEC::~JPEGDEC()
+{
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // a File or handle that was passed in can be gone by now, so only one opened here
+        JPEGCloseFileP(&_jpeg);
+} /* ~JPEGDEC() */
+
 void JPEGDEC::setFramebuffer(void *pFramebuffer)
 {
     JPEG_setFramebuffer(&_jpeg, pFramebuffer);
@@ -63,6 +76,9 @@ void JPEGDEC::setMaxOutputSize(int iMaxMCUs)
 //
 int JPEGDEC::openRAM(uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // and its file, when it was opened here
+        JPEGCloseFileP(&_jpeg);
     memset(&_jpeg, 0, sizeof(JPEGIMAGE));
     _jpeg.ucMemType = JPEG_MEM_RAM;
     _jpeg.pfnRead = readRAM;
@@ -78,6 +94,9 @@ int JPEGDEC::openRAM(uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw)
 
 int JPEGDEC::openFLASH(const uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // and its file, when it was opened here
+        JPEGCloseFileP(&_jpeg);
     memset(&_jpeg, 0, sizeof(JPEGIMAGE));
     _jpeg.ucMemType = JPEG_MEM_FLASH;
     _jpeg.pfnRead = readFLASH;
@@ -154,6 +173,9 @@ int JPEGDEC::getJPEGType()
 #ifdef __LINUX__
 int JPEGDEC::open(const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // and its file, when it was opened here
+        JPEGCloseFileP(&_jpeg);
     memset(&_jpeg, 0, sizeof(JPEGIMAGE));
     _jpeg.pfnRead = readFile;
     _jpeg.pfnClose = closeFile;
@@ -161,8 +183,12 @@ int JPEGDEC::open(const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
     _jpeg.pfnDraw = pfnDraw;
     _jpeg.iMaxMCUs = 1000;
     _jpeg.JPEGFile.fHandle = openFile(szFilename, &_jpeg.JPEGFile.iSize);
-    if (_jpeg.JPEGFile.fHandle == NULL) return 0;
-    return JPEGInit(&_jpeg);
+    if (_jpeg.JPEGFile.fHandle == NULL) {
+        _jpeg.pfnClose = NULL; // nothing to close
+        return 0;
+    }
+    _jpeg.bOwnsFile = 1;
+    return JPEGInitOwnedP(&_jpeg);
 } /* open() */
 #endif // __LINUX__
 //
@@ -170,6 +196,9 @@ int JPEGDEC::open(const char *szFilename, JPEG_DRAW_CALLBACK *pfnDraw)
 //
 int JPEGDEC::open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOSE_CALLBACK *pfnClose, JPEG_READ_CALLBACK *pfnRead, JPEG_SEEK_CALLBACK *pfnSeek, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // and its file, when it was opened here
+        JPEGCloseFileP(&_jpeg);
     memset(&_jpeg, 0, sizeof(JPEGIMAGE));
     _jpeg.pfnRead = pfnRead;
     _jpeg.pfnSeek = pfnSeek;
@@ -178,9 +207,12 @@ int JPEGDEC::open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOS
     _jpeg.pfnClose = pfnClose;
     _jpeg.iMaxMCUs = 1000; // set to an unnaturally high value to start
     _jpeg.JPEGFile.fHandle = (*pfnOpen)(szFilename, &_jpeg.JPEGFile.iSize);
-    if (_jpeg.JPEGFile.fHandle == NULL)
+    if (_jpeg.JPEGFile.fHandle == NULL) {
+       _jpeg.pfnClose = NULL; // nothing to close
        return 0;
-    return JPEGInit(&_jpeg);
+    }
+    _jpeg.bOwnsFile = 1;
+    return JPEGInitOwnedP(&_jpeg);
 
 } /* open() */
 
@@ -189,6 +221,9 @@ int JPEGDEC::open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOS
 //
 int JPEGDEC::open(void *fHandle, int iDataSize, JPEG_CLOSE_CALLBACK *pfnClose, JPEG_READ_CALLBACK *pfnRead, JPEG_SEEK_CALLBACK *pfnSeek, JPEG_DRAW_CALLBACK *pfnDraw)
 {
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // and its file, when it was opened here
+        JPEGCloseFileP(&_jpeg);
     memset(&_jpeg, 0, sizeof(JPEGIMAGE));
     _jpeg.pfnRead = pfnRead;
     _jpeg.pfnSeek = pfnSeek;
@@ -203,10 +238,14 @@ int JPEGDEC::open(void *fHandle, int iDataSize, JPEG_CLOSE_CALLBACK *pfnClose, J
 #ifdef FS_H
 static int32_t FileRead(JPEGFILE *handle, uint8_t *buffer, int32_t length)
 {
-    return ((File *)(handle->fHandle))->read(buffer, length);
+    int32_t iBytesRead = ((File *)(handle->fHandle))->read(buffer, length);
+    if (iBytesRead > 0) // the decoder compares iPos with iSize to see where the input ends
+        handle->iPos += iBytesRead;
+    return iBytesRead;
 }
 static int32_t FileSeek(JPEGFILE *handle, int32_t position)
 {
+    handle->iPos = position;
     return ((File *)(handle->fHandle))->seek(position);
 }
 static void FileClose(void *handle)
@@ -217,6 +256,9 @@ static void FileClose(void *handle)
 int JPEGDEC::open(File &file, JPEG_DRAW_CALLBACK *pfnDraw)
 {
     if (!file) return 0;
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    if (_jpeg.bOwnsFile) // and its file, when it was opened here
+        JPEGCloseFileP(&_jpeg);
     memset(&_jpeg, 0, sizeof(JPEGIMAGE));
     _jpeg.pfnRead = FileRead;
     _jpeg.pfnSeek = FileSeek;
@@ -231,8 +273,9 @@ int JPEGDEC::open(File &file, JPEG_DRAW_CALLBACK *pfnDraw)
 
 void JPEGDEC::close()
 {
-    if (_jpeg.pfnClose)
-        (*_jpeg.pfnClose)(_jpeg.JPEGFile.fHandle);
+    _jpeg.bDecodeActive = 0;
+    JPEGFreeP(&_jpeg); // the coefficients of a progressive image that was not finished
+    JPEGCloseFileP(&_jpeg);
 } /* close() */
 
 //

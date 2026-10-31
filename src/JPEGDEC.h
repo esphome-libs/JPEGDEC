@@ -49,7 +49,8 @@
 // Copyright (c) 2020 BitBank Software, Inc.
 // 
 // Designed to decode baseline JPEG images (8 or 24-bpp)
-// using less than 22K of RAM
+// using less than 22K of RAM; progressive images also need a
+// buffer for the coefficients of the whole image
 //
 
 /* Defines and variables */
@@ -57,7 +58,8 @@
 #define JPEG_FILE_BUF_SIZE 2048
 #define HUFF_TABLEN  273
 #define HUFF11SIZE (1<<11)
-#define DC_TABLE_SIZE 1024
+#define HUFF_TABLES 3 // a scan has up to 3 components, and each can have its own tables; rarely more than 2 of them
+#define DC_TABLE_SIZE 768 // codes up to 255, then the precalculated extra bits of the short ones at 512
 #define DCTSIZE 64
 #define MAX_MCU_COUNT 6
 #define MAX_COMPS_IN_SCAN 4
@@ -172,8 +174,8 @@ typedef struct _jpegcompinfo
 unsigned char component_needed;  /*  do we need the value of this component? */
 unsigned char component_id;     /* identifier for this component (0..255) */
 unsigned char component_index;  /* its index in SOF or cinfo->comp_info[] */
-//unsigned char h_samp_factor;    /* horizontal sampling factor (1..4) */
-//unsigned char v_samp_factor;    /* vertical sampling factor (1..4) */
+unsigned char h_samp_factor;    /* horizontal sampling factor (1..4) */
+unsigned char v_samp_factor;    /* vertical sampling factor (1..4) */
 unsigned char quant_tbl_no;     /* quantization table selector (0..3) */
 // These values may vary between scans
 // For compression, they must be supplied by the user interface
@@ -215,6 +217,7 @@ typedef struct jpeg_image_tag
     uint8_t iScanStart, iScanEnd, ucFF, ucNumComponents;
     uint8_t ucACTable, ucDCTable;
     uint8_t ucMemType, ucPixelType;
+    uint8_t bOwnsFile; // the file was opened here from its name, rather than given to us already open
     uint16_t u16MCUFlags;
     int iEXIF; // Offset to EXIF 'TIFF' file
     int iError;
@@ -230,6 +233,24 @@ typedef struct jpeg_image_tag
     int iDMAOffset; // ping-pong buffer offset carried between decodeRows() calls
     uint16_t *pAlignedPixels; // usPixels as it was when the decode started
     int bDecodeActive; // decodeBegin() succeeded and the image is not finished
+    int bDecoded; // decodeBegin() succeeded since the image was opened, which uses up its input and tables
+    // A progressive image is decoded scan by scan into a buffer of DCT coefficients, then drawn from it
+    int16_t *pCoefs; // the first iCoefKeep coefficients of every block in zigzag order, then flags of the rest
+    int iCoefKeep; // coefficients kept per block: 64, 5 at 1/4 scale, or only the DC at 1/8 scale or short of memory
+    int iCoefStride; // int16_t per block: iCoefKeep, and 4 more for the nonzero flags of the rest when there are any
+    int iCoefOffset[MAX_COMPS_IN_SCAN]; // first block of each component in pCoefs, or -1 when it is not kept
+    int iCoefPitch[MAX_COMPS_IN_SCAN]; // blocks per row of each component in pCoefs
+    int iScanX, iScanY; // next MCU of the scan, or block when the scan has one component
+    int iScanCX, iScanCY; // size of the scan in MCUs or blocks
+    int16_t *pQuantSaved; // a table per component after the coefficients, for tables redefined once it had a scan
+    uint8_t ucQuantScanned, ucQuantSaved; // the components that have had a scan, and whose table is in pQuantSaved
+    int iEOBRun; // blocks left in a run with no more AC coefficients
+    int iSkipLen; // bytes left of a marker segment being passed over between scans
+    int iRawOff, iRawSize; // input not yet filtered or parsed, in ucFileBuf after the filtered data
+    int iRawSaved; // bytes at iRawOff kept aside while zeros stand in for them, after a marker cut a scan short
+    uint8_t ucScanComp; // the component of a scan with one component
+    uint8_t ucProgState; // where the decode of the scans is
+    uint8_t ucScanMarker; // the scan's data ends at the marker at iRawOff
     JPEG_READ_CALLBACK *pfnRead;
     JPEG_SEEK_CALLBACK *pfnSeek;
     JPEG_DRAW_CALLBACK *pfnDraw;
@@ -247,8 +268,10 @@ typedef struct jpeg_image_tag
     void *pFramebuffer;
     int16_t sQuantTable[DCTSIZE*4]; // quantization tables
     uint8_t ucFileBuf[JPEG_FILE_BUF_SIZE]; // holds temp data and pixel stack
-    uint8_t ucHuffDC[DC_TABLE_SIZE * 2]; // up to 2 'short' tables
-    uint16_t usHuffAC[HUFF11SIZE * 2];
+    uint8_t ucHuffDC[DC_TABLE_SIZE * 2]; // the first 2 DC tables the scan uses, whatever their numbers
+    uint16_t usHuffAC[HUFF11SIZE * 2]; // the first 2 AC tables the scan uses, whatever their numbers
+    uint8_t *pHuffExtra; // a third DC and AC table, which only an extended sequential image can need, when it does
+    uint8_t ucDCSlot[4], ucACSlot[4]; // where each table number goes, 0xff when the scan doesn't use it
 } JPEGIMAGE;
 
 #ifdef __cplusplus
@@ -262,6 +285,11 @@ typedef struct jpeg_image_tag
 class JPEGDEC
 {
   public:
+    JPEGDEC();
+    ~JPEGDEC();
+    // A copy would free the coefficient buffer of a progressive image a second time
+    JPEGDEC(const JPEGDEC &) = delete;
+    JPEGDEC &operator=(const JPEGDEC &) = delete;
     int openRAM(uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw);
     int openFLASH(const uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw);
     int open(const char *szFilename, JPEG_OPEN_CALLBACK *pfnOpen, JPEG_CLOSE_CALLBACK *pfnClose, JPEG_READ_CALLBACK *pfnRead, JPEG_SEEK_CALLBACK *pfnSeek, JPEG_DRAW_CALLBACK *pfnDraw);
