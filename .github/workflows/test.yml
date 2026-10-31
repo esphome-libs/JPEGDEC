@@ -36,7 +36,7 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install what makes the test images
         run: sudo apt-get update && sudo apt-get install -y libjpeg-turbo-progs python3-pil
       - name: Run the tests
