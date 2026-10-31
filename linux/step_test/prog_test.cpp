@@ -8,6 +8,7 @@
 #include <cstring>
 #include <new>
 #include <type_traits>
+#include <deque>
 #include <vector>
 
 // The coefficient buffer comes from these, which count the buffers held and can be made to fail
@@ -558,12 +559,14 @@ static std::vector<uint8_t> g_file_data;
 struct CountedFile {
   bool open;
 };
+static std::deque<CountedFile> g_files; // kept after they are closed, to see a second close
 static void *open_file_cb(const char *name, int32_t *size) {
   if (name[0] == 'n')
     return nullptr;
   g_files_open++;
   *size = static_cast<int32_t>(g_file_data.size());
-  return new CountedFile{true};
+  g_files.push_back(CountedFile{true});
+  return &g_files.back();
 }
 static void close_file_cb(void *handle) {
   auto *file = static_cast<CountedFile *>(handle);
@@ -644,6 +647,7 @@ static int file_handle_checks(const std::vector<uint8_t> &prog, const char *name
     check(g_files_open == 0, "close() of a bad file");
   }
   g_file_data = good;
+  g_files.clear();
   return failures;
 }
 
