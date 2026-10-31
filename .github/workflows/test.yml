@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            cc: gcc
+            cxx: g++
+            timeout: 15
+            cxxflags: -Wall -O2 -D__LINUX__
+          - name: clang
+            cc: clang
+            cxx: clang++
+            timeout: 15
+            cxxflags: -Wall -O2 -D__LINUX__
+          - name: gcc with AddressSanitizer
+            cc: gcc
+            cxx: g++
+            timeout: 90
+            cxxflags: -Wall -O1 -g -D__LINUX__ -fsanitize=address -fno-omit-frame-pointer
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install what makes the test images
+        run: sudo apt-get update && sudo apt-get install -y libjpeg-turbo-progs python3-pil
+      - name: Run the tests
+        run: make -C linux/step_test run CXXFLAGS="${{ matrix.cxxflags }}"
+      - name: Build the C example
+        run: make -C linux/examples/c_cmdline
