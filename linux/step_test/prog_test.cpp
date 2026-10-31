@@ -3,6 +3,8 @@
 // bytes trickle in. Also checks that a progressive file cut short still draws the whole image, from the scans that
 // arrived. The pairs of files are listed in the file named on the command line, a baseline and a progressive file
 // on each line. The second file can also be an extended sequential (SOF1) twin, which gets the same comparisons.
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
