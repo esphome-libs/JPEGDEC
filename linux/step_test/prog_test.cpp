@@ -32,6 +32,30 @@ static void test_free(void *p) {
 #define JPEG_MALLOC(size) test_malloc(size)
 #define JPEG_FREE(p) test_free(p)
 
+// A File as in Arduino's FS.h, which turns on open(File &) in JPEGDEC. It keeps its own position, as a real one does.
+#define FS_H
+class File {
+public:
+  explicit File(const std::vector<uint8_t> &data) : data_(&data) {}
+  explicit operator bool() const { return true; }
+  int read(uint8_t *buf, int32_t len) {
+    const int n = std::min<int>(len, static_cast<int>(data_->size() - pos_));
+    memcpy(buf, data_->data() + pos_, n);
+    pos_ += n;
+    return n;
+  }
+  bool seek(uint32_t pos) {
+    pos_ = pos;
+    return pos <= data_->size();
+  }
+  size_t size() const { return data_->size(); }
+  void close() {}
+
+private:
+  const std::vector<uint8_t> *data_;
+  size_t pos_{0};
+};
+
 #include "../../src/JPEGDEC.h"
 #include "../../src/JPEGDEC.cpp"
 
@@ -652,6 +676,43 @@ static int file_handle_checks(const std::vector<uint8_t> &prog, const char *name
   return failures;
 }
 
+// open(File &) sees where the input ends as the other sources do: a file cut short still draws, in one call or in steps
+static int file_object_checks(const std::vector<uint8_t> &prog, const char *name, int *checks) {
+  int failures = 0;
+  for (int percent : {30, 60, 100}) {
+    const size_t size = std::max<size_t>(prog.size() * percent / 100, std::min<size_t>(prog.size(), 600));
+    const std::vector<uint8_t> cut(prog.begin(), prog.begin() + size);
+    Record ref;
+    JPEGDEC ram;
+    ram.openRAM(const_cast<uint8_t *>(cut.data()), static_cast<int>(cut.size()), draw_cb);
+    ram.setUserPointer(&ref);
+    const int ref_status = ram.decode(0, 0, 0);
+    ram.close();
+    for (int step : {0, 2}) {
+      Record got;
+      File file(cut);
+      JPEGDEC jpeg;
+      int status = jpeg.open(file, draw_cb);
+      jpeg.setUserPointer(&got);
+      if (status && step == 0) {
+        status = jpeg.decode(0, 0, 0);
+      } else if (status) {
+        status = jpeg.decodeBegin(0, 0, 0);
+        while (status && (status = jpeg.decodeRows(step)) == JPEG_DECODE_MORE) {
+        }
+      }
+      const int error = jpeg.getLastError();
+      jpeg.close();
+      (*checks)++;
+      if (ref_status != 1 || status != 1 || got.pixels != ref.pixels) {
+        printf("FAIL %s File cut to %d%% step %d: status %d/%d error %d\n", name, percent, step, status, ref_status, error);
+        failures++;
+      }
+    }
+  }
+  return failures;
+}
+
 // Dithering is the same whatever Huffman tables and scans the file had before it. Only with whole MCUs: the padding
 // past the edges goes through the dither too, and a progressive file may leave it out.
 static int dither_checks(const std::vector<uint8_t> &base, const std::vector<uint8_t> &twin, const char *name, int *checks) {
@@ -830,6 +891,7 @@ int main(int argc, char **argv) {
     }
     failures += edge_checks(prog, prog_name, &checks);
     failures += file_handle_checks(prog, prog_name, &checks);
+    failures += file_object_checks(prog, prog_name, &checks);
     if (prog.size() > 2048)
       failures += scan_cut_by_marker_checks(prog, prog_name, configs[0], &checks);
     if (strstr(prog_name, "scans_spectral") != nullptr)

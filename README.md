@@ -42,7 +42,7 @@ if (jpeg.decodeBegin(0, 0, 0)) {
 jpeg.close();
 ```
 
-Input may arrive slowly, as from a download: the read callback can return fewer bytes than asked for while the file is incomplete. When less than `JPEG_INPUT_MARGIN` bytes are buffered, `decodeRows()` returns `JPEG_DECODE_NEED_DATA`, and the next call carries on from the same MCU. The headers must be readable when the image is opened.
+Input may arrive slowly, as from a download: the read callback can return fewer bytes than asked for while the file is incomplete. When less than `JPEG_INPUT_MARGIN` bytes are buffered, `decodeRows()` returns `JPEG_DECODE_NEED_DATA`, and the next call carries on from the same MCU. The headers must be readable when the image is opened. Your read callback must add what it read to `iPos` of the `JPEGFILE` it is given, and your seek callback must set it, as a progressive image's end of input is found by comparing it with `iSize`.
 
 ### Progressive images
 

@@ -238,10 +238,14 @@ int JPEGDEC::open(void *fHandle, int iDataSize, JPEG_CLOSE_CALLBACK *pfnClose, J
 #ifdef FS_H
 static int32_t FileRead(JPEGFILE *handle, uint8_t *buffer, int32_t length)
 {
-    return ((File *)(handle->fHandle))->read(buffer, length);
+    int32_t iBytesRead = ((File *)(handle->fHandle))->read(buffer, length);
+    if (iBytesRead > 0) // the decoder compares iPos with iSize to see where the input ends
+        handle->iPos += iBytesRead;
+    return iBytesRead;
 }
 static int32_t FileSeek(JPEGFILE *handle, int32_t position)
 {
+    handle->iPos = position;
     return ((File *)(handle->fHandle))->seek(position);
 }
 static void FileClose(void *handle)
