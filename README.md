@@ -26,7 +26,7 @@ lib_deps =
     https://github.com/esphome-libs/JPEGDEC#<tag>
 ```
 
-The API is upstream's, described in its [wiki](https://github.com/bitbank2/JPEGDEC/wiki).
+The API is upstream's, described in its [wiki](https://github.com/bitbank2/JPEGDEC/wiki). `decodeDither()` fails with `JPEG_INVALID_PARAMETER` when a row of MCUs, at the scale asked for, is over 4088 pixels wide, or 2040 with `JPEG_USES_DMA`, as the errors of a whole row are kept in the pixel buffer.
 
 ### Decoding in steps
 

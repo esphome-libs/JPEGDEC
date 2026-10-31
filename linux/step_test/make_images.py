@@ -179,6 +179,16 @@ def main(out: Path, more: list[Path]) -> None:
     pairs += [(base, twin) for twin in twins(base, out, False)]
     for base in more:
         pairs += [(base, twin) for twin in twins(base, out, False)]
+    # Rows around the widest a dither can do, kept apart as only prog_test wants them
+    wide = out / "wide"
+    wide.mkdir(exist_ok=True)
+    for width in (2040, 2048, 4088, 4096, 5000):
+        base = wide / f"gray_{width}.jpg"
+        pattern(width, 16, "L").save(base, quality=85)
+        if width in (4088, 5000):
+            subprocess.run(["jpegtran", "-progressive", "-outfile", str(wide / f"prog_{width}.jpg"), str(base)], check=True)
+    pattern(4081, 16, "RGB").save(wide / "420_4081.jpg", quality=85, subsampling=2)  # rows of 4096, in MCUs of 16
+    pattern(4081, 16, "RGB").save(wide / "444_4081.jpg", quality=85, subsampling=0)  # rows of 4088, in MCUs of 8
     (out / "pairs.txt").write_text("".join(f"{a} {b}\n" for a, b in pairs))
 
 

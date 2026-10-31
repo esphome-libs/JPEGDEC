@@ -9,6 +9,7 @@
 #include <new>
 #include <type_traits>
 #include <deque>
+#include <string>
 #include <vector>
 
 // The coefficient buffer comes from these, which count the buffers held and can be made to fail
@@ -685,6 +686,59 @@ static int dither_checks(const std::vector<uint8_t> &base, const std::vector<uin
   return failures;
 }
 
+// A row too wide for the errors of a dither is refused, rather than overwriting what is after them
+static int dither_width_checks(const std::string &dir, int *checks) {
+  static const struct {
+    const char *file;
+    int options;
+    bool good;
+  } cases[] = {
+      {"gray_4088.jpg", 0, true},
+      {"prog_4088.jpg", 0, true},
+      {"gray_4096.jpg", 0, false},
+      {"gray_5000.jpg", 0, false},
+      {"prog_5000.jpg", 0, false},
+      {"gray_5000.jpg", JPEG_SCALE_HALF, true},
+      {"prog_5000.jpg", JPEG_SCALE_HALF, true},
+      {"gray_5000.jpg", JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH, true},
+      {"444_4081.jpg", 0, true},
+      {"420_4081.jpg", 0, false},
+      {"gray_2040.jpg", JPEG_USES_DMA, true},
+      {"gray_2048.jpg", JPEG_USES_DMA, false},
+      {"gray_4088.jpg", JPEG_USES_DMA, false},
+      {"gray_4088.jpg", JPEG_USES_DMA | JPEG_SCALE_HALF, true},
+  };
+  int failures = 0;
+  for (const auto &c : cases) {
+    const std::vector<uint8_t> file = load((dir + c.file).c_str());
+    if (file.empty()) {
+      printf("cannot open %s%s\n", dir.c_str(), c.file);
+      return ++failures;
+    }
+    for (int type : {ONE_BIT_DITHERED, TWO_BIT_DITHERED, FOUR_BIT_DITHERED}) {
+      Record rec;
+      JPEGDEC jpeg;
+      (*checks)++;
+      if (!jpeg.openRAM(const_cast<uint8_t *>(file.data()), static_cast<int>(file.size()), draw_cb)) {
+        printf("FAIL %s: open failed, error %d\n", c.file, jpeg.getLastError());
+        failures++;
+        continue;
+      }
+      jpeg.setUserPointer(&rec);
+      jpeg.setPixelType(type);
+      std::vector<uint8_t> dither(static_cast<size_t>(jpeg.getWidth() + 16) * 16);
+      const int status = jpeg.decodeDither(dither.data(), c.options);
+      const int error = jpeg.getLastError();
+      jpeg.close();
+      if (c.good ? (status != 1 || rec.calls == 0) : (status != 0 || error != JPEG_INVALID_PARAMETER || rec.calls != 0)) {
+        printf("FAIL %s options %d dither type %d: status %d error %d, %d calls\n", c.file, c.options, type, status, error, rec.calls);
+        failures++;
+      }
+    }
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -800,6 +854,8 @@ int main(int argc, char **argv) {
     }
   }
   fclose(list);
+  const std::string pairs = argv[1];
+  failures += dither_width_checks(pairs.substr(0, pairs.rfind('/') + 1) + "wide/", &checks);
   printf("%d progressive checks, %d failures\n", checks, failures);
   return failures != 0;
 }

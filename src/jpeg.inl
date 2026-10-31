@@ -5936,6 +5936,18 @@ static int JPEGDecodeStart(JPEGIMAGE *pJPEG)
         pJPEG->iOptions &= ~(JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH);
     else if (pJPEG->iOptions & JPEG_SCALE_QUARTER)
         pJPEG->iOptions &= ~JPEG_SCALE_EIGHTH;
+    // A dither keeps the errors of a whole row of MCUs and 2 more in usPixels, or in half of it with the ping-pong buffer
+    if (pJPEG->ucPixelType > EIGHT_BIT_GRAYSCALE)
+    {
+        i = ((pJPEG->ucSubSample & 0xf0) == 0x20) ? 16 : 8;
+        i = (pJPEG->iWidth + i - 1) & -i;
+        i >>= (pJPEG->iOptions & JPEG_SCALE_HALF) ? 1 : (pJPEG->iOptions & JPEG_SCALE_QUARTER) ? 2 : (pJPEG->iOptions & JPEG_SCALE_EIGHTH) ? 3 : 0;
+        if (i + 2 > (int)(MAX_BUFFERED_PIXELS * sizeof(uint16_t)) / ((pJPEG->iOptions & JPEG_USES_DMA) ? 2 : 1))
+        {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+    }
     if (pJPEG->iOptions & JPEG_LUMA_ONLY && pJPEG->ucPixelType < EIGHT_BIT_GRAYSCALE) {
         pJPEG->ucPixelType = EIGHT_BIT_GRAYSCALE; // switch to grayscale output
     }
