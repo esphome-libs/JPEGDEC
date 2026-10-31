@@ -651,6 +651,40 @@ static int file_handle_checks(const std::vector<uint8_t> &prog, const char *name
   return failures;
 }
 
+// Dithering is the same whatever Huffman tables and scans the file had before it. Only with whole MCUs: the padding
+// past the edges goes through the dither too, and a progressive file may leave it out.
+static int dither_checks(const std::vector<uint8_t> &base, const std::vector<uint8_t> &twin, const char *name, int *checks) {
+  static const int types[] = {ONE_BIT_DITHERED, TWO_BIT_DITHERED, FOUR_BIT_DITHERED};
+  int failures = 0;
+  for (int type : types) {
+    Record rec[2];
+    for (int i = 0; i < 2; i++) {
+      const std::vector<uint8_t> &file = i == 0 ? base : twin;
+      JPEGDEC jpeg;
+      if (!jpeg.openRAM(const_cast<uint8_t *>(file.data()), static_cast<int>(file.size()), draw_cb))
+        return ++failures;
+      if (jpeg.getWidth() % 16 != 0 || jpeg.getHeight() % 16 != 0) {
+        jpeg.close();
+        return failures;
+      }
+      jpeg.setUserPointer(&rec[i]);
+      jpeg.setPixelType(type);
+      std::vector<uint8_t> dither(static_cast<size_t>(jpeg.getWidth()) * 16);
+      if (jpeg.decodeDither(dither.data(), 0) != 1) {
+        printf("FAIL %s: dither type %d decode failed, error %d\n", name, type, jpeg.getLastError());
+        failures++;
+      }
+      jpeg.close();
+    }
+    (*checks)++;
+    if (rec[0].pixels != rec[1].pixels) {
+      printf("FAIL %s: dither type %d differs from the baseline file\n", name, type);
+      failures++;
+    }
+  }
+  return failures;
+}
+
 static const char *differs(const Result &got, const Result &ref, bool pixels = true) {
   if (got.status != ref.status)
     return "status";
@@ -733,6 +767,7 @@ int main(int argc, char **argv) {
     }
     failures += bad_sos_checks(base, base_name, &checks);
     failures += bad_sos_checks(prog, prog_name, &checks);
+    failures += dither_checks(base, prog, prog_name, &checks);
     JPEGDEC probe;
     probe.openRAM(const_cast<uint8_t *>(prog.data()), static_cast<int>(prog.size()), draw_cb);
     if (probe.getJPEGType() != JPEG_MODE_PROGRESSIVE) {

@@ -6006,6 +6006,9 @@ static int JPEGDecodeRows(JPEGIMAGE *pJPEG, int iRows, int bCanPause)
     }
     bFromCoefs = (pJPEG->pCoefs != NULL);
     pAlignedPixels = pJPEG->pAlignedPixels;
+    // The errors of a dither start at zero; until the first row is drawn this has held Huffman values and scan input
+    if (pJPEG->pDitherBuffer && pJPEG->iDecodeRow == 0 && pJPEG->iDecodeCol == 0)
+        memset(pAlignedPixels, 0, MAX_BUFFERED_PIXELS * sizeof(uint16_t));
     // Fast downscaling options
     if (pJPEG->iOptions & JPEG_SCALE_HALF)
         iScaleShift = 1;
