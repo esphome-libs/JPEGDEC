@@ -61,7 +61,7 @@ cd linux/step_test
 make
 ```
 
-This needs Python with Pillow, and `jpegtran` and `cjpeg` from libjpeg-turbo, to write the test images. `step_test` checks that decoding in steps gives the same output as `decode()`; `crop_test` checks cropping and framebuffer output at every scale; `prog_test` checks that progressive files made by `jpegtran` give exactly the same output as the baseline files they were made from, which hold the same coefficients, and that a progressive file cut short still draws.
+This needs Python with Pillow, and `jpegtran` and `cjpeg` from libjpeg-turbo, to write the test images. `step_test` checks that decoding in steps gives the same output as `decode()`; `crop_test` checks cropping and framebuffer output at every scale; `prog_test` checks that progressive files made by `jpegtran` give exactly the same output as the baseline files they were made from, which hold the same coefficients, and that a progressive file cut short still draws. GitHub Actions runs them on every pull request and on pushes to `main`, built with GCC, with Clang, and with AddressSanitizer.
 
 ## Releases
 
