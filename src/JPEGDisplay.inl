@@ -53,11 +53,14 @@ static void jpegClose(void *handle) {
 static int32_t jpegRead(JPEGFILE *handle, uint8_t *buffer, int32_t length) {
   File *pFile = (File *)handle->fHandle;
   if (!pFile) return 0;
-  return pFile->read(buffer, length);
+  int32_t iBytesRead = pFile->read(buffer, length);
+  if (iBytesRead > 0) handle->iPos += iBytesRead; // the decoder compares iPos with iSize to see where the input ends
+  return iBytesRead;
 }
 static int32_t jpegSeek(JPEGFILE *handle, int32_t position) {
   File *pFile = (File *)handle->fHandle;
   if (!pFile) return 0;
+  handle->iPos = position;
   return pFile->seek(position);
 }
 
